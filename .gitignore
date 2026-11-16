@@ -28,3 +28,6 @@ coverage/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Generated fixture output
+.fixtures/

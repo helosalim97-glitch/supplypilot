@@ -11,6 +11,8 @@
     "typecheck": "pnpm -r --if-present run typecheck",
     "test": "pnpm -r --if-present run test",
     "services:up": "docker compose -f infra/compose/docker-compose.yml --env-file .env up -d --wait",
-    "services:down": "docker compose -f infra/compose/docker-compose.yml --env-file .env down"
+    "services:down": "docker compose -f infra/compose/docker-compose.yml --env-file .env down",
+    "test:fixtures": "cd packages/fixtures && python3 -m unittest discover -s tests -t .",
+    "fixtures": "cd packages/fixtures && python3 -m supplypilot_fixtures --out ../../.fixtures"
   }
 }

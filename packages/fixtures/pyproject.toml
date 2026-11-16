@@ -1,0 +1,9 @@
+[project]
+name = "supplypilot-fixtures"
+version = "0.1.0"
+description = "Deterministic synthetic supply chain data for SupplyPilot demos and tests"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+supplypilot-fixtures = "supplypilot_fixtures.__main__:main"

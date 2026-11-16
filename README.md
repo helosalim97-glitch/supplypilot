@@ -114,4 +114,11 @@ supplypilot/
 
 ## Getting started
 
-Setup instructions will be added once the first services are in place.
+Full setup instructions will be added once the first services are in place. What exists today:
+
+```bash
+cp .env.example .env
+pnpm services:up        # PostgreSQL and Redis via Docker Compose
+pnpm fixtures           # generate synthetic data into .fixtures/ (needs Python 3.11+)
+pnpm test:fixtures      # run the fixture generator's tests
+```
