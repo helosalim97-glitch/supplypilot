@@ -2,7 +2,7 @@
 
 **Inventory intelligence for multi-location merchants.** SupplyPilot shows which stockouts come from late suppliers, which purchase orders are delayed, and what a proposed reorder would do to inventory and cash, with the numbers behind every recommendation.
 
-> **Status:** early development. The project is being built over a 12-week roadmap (see below). It uses only synthetic data and local mocks.
+> **Status:** early development. The project is being built over a 6-week roadmap (see below). It uses only synthetic data and local mocks.
 
 ## The problem
 
@@ -97,14 +97,14 @@ supplypilot/
 
 ## Roadmap
 
-| Weeks | Focus |
-|---|---|
-| 1–2 | Monorepo setup, synthetic fixtures, tenant identity and roles |
-| 3–4 | SKU, warehouse and supplier models; stock ledger and balances |
-| 5–7 | CSV import, purchase order approvals, receiving and partial shipments |
-| 8–9 | Reorder-point calculator, scenario simulation, versioned snapshots |
-| 10 | AI explanation adapter with citation checks |
-| 11–12 | Hardening, deployment and the end-to-end demo |
+| Week | Focus | Status |
+|---|---|---|
+| Week 1 | **Foundation** — Add pnpm monorepo skeleton and Compose stack for PostgreSQL and Redis, add deterministic synthetic supply chain generator with tests | ✅ Done |
+| Week 2 | **Tenancy & catalog** — Bootstrap NestJS API with health endpoint and migrations, add organizations, memberships and role guard, add SKU, warehouse and supplier models, add catalog endpoints with validation and error envelope | Planned |
+| Week 3 | **Stock ledger & CSV import** — Add append-only inventory events and movement endpoint, project stock balances and expose GET /v1/inventory, add CSV upload, column mapping and preview, deduplicate rows and apply imports as movements in a job | Planned |
+| Week 4 | **Purchasing & receiving** — Add purchase orders and lines, add approval state machine with audit events, record receipts including partial shipments, add purchase order list, approval and receiving screens | Planned |
+| Week 5 | **Reorder & scenarios** — Bootstrap FastAPI worker with lead-time statistics, add reorder-point calculator with unit tests, add reorder proposals and decision endpoint, add demand scenario sandbox with versioned snapshots, show reorder evidence and scenario results | Planned |
+| Week 6 | **AI explanations & release** — Add explanation adapter with mock model and citation checks, cover invalid output, prompt injection and cross-tenant evidence, add lint, typecheck, test and migration checks, add setup guide, demo script and progress notes | Planned |
 
 ## Documentation
 
