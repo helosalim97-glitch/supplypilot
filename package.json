@@ -1,0 +1,16 @@
+{
+  "name": "supplypilot",
+  "private": true,
+  "description": "Inventory intelligence for multi-location merchants",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "lint": "pnpm -r --if-present run lint",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "test": "pnpm -r --if-present run test",
+    "services:up": "docker compose -f infra/compose/docker-compose.yml --env-file .env up -d --wait",
+    "services:down": "docker compose -f infra/compose/docker-compose.yml --env-file .env down"
+  }
+}
