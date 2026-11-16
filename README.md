@@ -106,6 +106,12 @@ supplypilot/
 | 10 | AI explanation adapter with citation checks |
 | 11–12 | Hardening, deployment and the end-to-end demo |
 
+## Documentation
+
+- [Architecture decisions](docs/adr/README.md)
+- [Week 01 acceptance cases](docs/acceptance/week-01-monorepo-and-fixtures.md)
+- [Progress notes](docs/progress/week-01.md)
+
 ## Getting started
 
 Setup instructions will be added once the first services are in place.
