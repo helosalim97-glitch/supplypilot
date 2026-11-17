@@ -35,6 +35,7 @@ Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
 |---|---|
 | `GET /v1/me/organizations` | Any valid token; lists the caller's organizations and roles |
 | `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
+| Catalog routes (below) | Member of `:orgId`; writes need `manager` |
 
 `TenantGuard` runs on these routes. A missing or invalid token gets `401`.
 Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
@@ -54,6 +55,55 @@ orders keep their references.
 `CatalogRepository` scopes every query by organization id and turns duplicate
 codes and unknown references into `DuplicateCodeError` and
 `UnknownReferenceError`.
+
+### Endpoints
+
+All routes are under `/v1/organizations/:orgId`. Any member can read; creating
+records needs `manager` or higher. Successful responses are `{ "data": ... }`.
+
+| Route | Role | Notes |
+|---|---|---|
+| `GET /suppliers`, `GET /warehouses`, `GET /skus` | viewer | Active (non-archived) records, ordered by code |
+| `GET /suppliers/:id`, `GET /warehouses/:id`, `GET /skus/:id` | viewer | `404` for unknown, malformed or other-tenant ids |
+| `POST /suppliers` | manager | `code`, `name`, optional `contactEmail` |
+| `POST /warehouses` | manager | `code`, `name` |
+| `POST /skus` | manager | `code`, `name`, `unit`, `unitCostCents`, optional `reorderPoint` (default 0) and `preferredSupplierId` |
+
+Validation mirrors the database constraints: codes are 1–40 letters, digits,
+`.`, `_` or `-`; names are trimmed and must not be blank; `unit` is lowercase
+(`each`, `case_12`); amounts are whole numbers ≥ 0. Unknown fields are
+rejected. A duplicate code in the same organization (any case) returns `409`;
+a preferred supplier from another organization returns `422`.
+
+## Errors
+
+Every error response has the same shape:
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "Some fields are invalid",
+    "details": [{ "field": "unitCostCents", "message": "must be a whole number from 0 to 2147483647" }],
+    "requestId": "3f0c5c3e-6d0e-4a59-9a43-2b1f0f8a7c11"
+  }
+}
+```
+
+| Status | `code` |
+|---|---|
+| 401 | `unauthorized` |
+| 403 | `forbidden` |
+| 404 | `not_found` |
+| 409 | `duplicate_code` |
+| 422 | `validation_failed` (with `details`) |
+| 500 | `internal_error` |
+
+Each request gets a correlation id: the caller's `X-Request-Id` if it is 8–128
+characters of letters, digits, `.`, `_` or `-`, otherwise a new UUID. It is
+returned in the `X-Request-Id` header and in `error.requestId`. Unexpected
+errors are logged with that id; their details are never sent to the client.
+`GET /v1/health` keeps its own report body for both `200` and `503`.
 
 ## Migrations
 
