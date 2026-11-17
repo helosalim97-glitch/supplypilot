@@ -42,6 +42,19 @@ least that role; otherwise `403`. Unknown organizations and other tenants'
 organizations get the same `403`, so responses don't reveal which
 organizations exist.
 
+## Catalog
+
+Migration `0003_catalog` adds `suppliers`, `warehouses` and `skus`. Each row
+belongs to one organization, and `code` is unique per organization
+(case-insensitive). A SKU's preferred supplier must be in the same
+organization (composite foreign key). Unit costs are integer cents. Records are
+archived (`archived_at`) instead of deleted, so later stock events and purchase
+orders keep their references.
+
+`CatalogRepository` scopes every query by organization id and turns duplicate
+codes and unknown references into `DuplicateCodeError` and
+`UnknownReferenceError`.
+
 ## Migrations
 
 Plain SQL files in `migrations/`, named `NNNN_snake_case_name.sql`, applied in
