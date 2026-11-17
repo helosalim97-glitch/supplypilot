@@ -100,7 +100,7 @@ supplypilot/
 | Week | Focus | Status |
 |---|---|---|
 | Week 1 | **Foundation** — Add pnpm monorepo skeleton and Compose stack for PostgreSQL and Redis, add deterministic synthetic supply chain generator with tests | ✅ Done |
-| Week 2 | **Tenancy & catalog** — Bootstrap NestJS API with health endpoint and migrations, add organizations, memberships and role guard, add SKU, warehouse and supplier models, add catalog endpoints with validation and error envelope | Planned |
+| Week 2 | **Tenancy & catalog** — Bootstrap NestJS API with health endpoint and migrations, add organizations, memberships and role guard, add SKU, warehouse and supplier models, add catalog endpoints with validation and error envelope | ✅ Done |
 | Week 3 | **Stock ledger & CSV import** — Add append-only inventory events and movement endpoint, project stock balances and expose GET /v1/inventory, add CSV upload, column mapping and preview, deduplicate rows and apply imports as movements in a job | Planned |
 | Week 4 | **Purchasing & receiving** — Add purchase orders and lines, add approval state machine with audit events, record receipts including partial shipments, add purchase order list, approval and receiving screens | Planned |
 | Week 5 | **Reorder & scenarios** — Bootstrap FastAPI worker with lead-time statistics, add reorder-point calculator with unit tests, add reorder proposals and decision endpoint, add demand scenario sandbox with versioned snapshots, show reorder evidence and scenario results | Planned |
