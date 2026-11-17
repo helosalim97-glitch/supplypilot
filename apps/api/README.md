@@ -22,6 +22,26 @@ pnpm api:dev                  # http://localhost:3001/v1/health
 `503` with `"status":"degraded"` when PostgreSQL does not answer. Error details
 are never included in the response.
 
+## Tenancy and roles
+
+Every user belongs to one or more organizations through a membership with a
+role: `owner` > `manager` > `buyer` > `viewer` (a higher role can do everything
+a lower one can).
+
+Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
+`api_tokens` as SHA-256 hashes only, and can expire or be revoked.
+
+| Route | Access |
+|---|---|
+| `GET /v1/me/organizations` | Any valid token; lists the caller's organizations and roles |
+| `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
+
+`TenantGuard` runs on these routes. A missing or invalid token gets `401`.
+Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
+least that role; otherwise `403`. Unknown organizations and other tenants'
+organizations get the same `403`, so responses don't reveal which
+organizations exist.
+
 ## Migrations
 
 Plain SQL files in `migrations/`, named `NNNN_snake_case_name.sql`, applied in
