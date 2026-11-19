@@ -36,6 +36,7 @@ Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
 | `GET /v1/me/organizations` | Any valid token; lists the caller's organizations and roles |
 | `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
 | Catalog routes (below) | Member of `:orgId`; writes need `manager` |
+| `POST /v1/organizations/:orgId/inventory/movements` | `manager` |
 
 `TenantGuard` runs on these routes. A missing or invalid token gets `401`.
 Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
@@ -75,6 +76,42 @@ Validation mirrors the database constraints: codes are 1–40 letters, digits,
 rejected. A duplicate code in the same organization (any case) returns `409`;
 a preferred supplier from another organization returns `422`.
 
+## Inventory ledger
+
+Migration `0004_inventory_events` adds `inventory_events`, the stock ledger.
+Every change to on-hand stock is one event for a SKU in a warehouse, with a
+signed `quantity_delta`. The table is append-only: a trigger rejects `UPDATE`,
+`DELETE` and `TRUNCATE`. A wrong event is fixed with a `correction` event that
+points at it (`correctsEventId`), so the history stays auditable. SKU,
+warehouse and corrected event must belong to the same organization (composite
+foreign keys).
+
+### `POST /v1/organizations/:orgId/inventory/movements`
+
+Needs `manager`. Requires an `Idempotency-Key` header (8–100 letters, digits,
+`.`, `_`, `:` or `-`), unique per organization.
+
+| Field | Notes |
+|---|---|
+| `skuId`, `warehouseId` | Active (non-archived) records of this organization |
+| `type` | `receipt`, `issue`, `adjustment` or `correction` |
+| `quantity` | Receipts and issues: whole number ≥ 1 (an issue is stored as a negative delta). Adjustments and corrections: signed, non-zero |
+| `reason` | Optional, up to 500 characters; required for adjustments |
+| `reference` | Optional, up to 120 characters (e.g. a PO or order number) |
+| `occurredAt` | Optional ISO 8601 date-time with a time zone, not in the future; defaults to now |
+| `correctsEventId` | Required for corrections, not allowed otherwise; must be an event for the same SKU and warehouse |
+
+Responses:
+
+- `201` with `{ "data": event }` and `Idempotent-Replayed: false` for a new movement.
+- `200` with the original event and `Idempotent-Replayed: true` when the same
+  key is retried with the same body, so a retried request never counts stock
+  twice.
+- `409 idempotency_conflict` when the key was already used for a different
+  movement.
+- `422` for invalid fields, or a SKU, warehouse or corrected event that is
+  not in this organization.
+
 ## Errors
 
 Every error response has the same shape:
@@ -95,7 +132,7 @@ Every error response has the same shape:
 | 401 | `unauthorized` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
-| 409 | `duplicate_code` |
+| 409 | `duplicate_code`, `idempotency_conflict` |
 | 422 | `validation_failed` (with `details`) |
 | 500 | `internal_error` |
 
