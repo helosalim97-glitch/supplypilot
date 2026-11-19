@@ -15,6 +15,8 @@ pnpm api:dev                  # http://localhost:3001/v1/health
 |---|---|---|
 | `API_PORT` | `3001` | HTTP port |
 | `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `IMPORT_WORKER_POLL_MS` | `2000` | How often the import worker looks for queued imports (0–60000; `0` turns it off) |
+| `IMPORT_STALE_AFTER_SECONDS` | `600` | An import stuck in `applying` this long is taken over (30–86400) |
 
 ## Health
 
@@ -36,6 +38,7 @@ Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
 | `GET /v1/me/organizations` | Any valid token; lists the caller's organizations and roles |
 | `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
 | Catalog routes (below) | Member of `:orgId`; writes need `manager` |
+| `POST /v1/organizations/:orgId/inventory/movements` | `manager` |
 
 `TenantGuard` runs on these routes. A missing or invalid token gets `401`.
 Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
@@ -75,6 +78,208 @@ Validation mirrors the database constraints: codes are 1–40 letters, digits,
 rejected. A duplicate code in the same organization (any case) returns `409`;
 a preferred supplier from another organization returns `422`.
 
+## Inventory ledger
+
+Migration `0004_inventory_events` adds `inventory_events`, the stock ledger.
+Every change to on-hand stock is one event for a SKU in a warehouse, with a
+signed `quantity_delta`. The table is append-only: a trigger rejects `UPDATE`,
+`DELETE` and `TRUNCATE`. A wrong event is fixed with a `correction` event that
+points at it (`correctsEventId`), so the history stays auditable. SKU,
+warehouse and corrected event must belong to the same organization (composite
+foreign keys).
+
+### `POST /v1/organizations/:orgId/inventory/movements`
+
+Needs `manager`. Requires an `Idempotency-Key` header (8–100 letters, digits,
+`.`, `_`, `:` or `-`), unique per organization.
+
+| Field | Notes |
+|---|---|
+| `skuId`, `warehouseId` | Active (non-archived) records of this organization |
+| `type` | `receipt`, `issue`, `adjustment` or `correction` |
+| `quantity` | Receipts and issues: whole number ≥ 1 (an issue is stored as a negative delta). Adjustments and corrections: signed, non-zero |
+| `reason` | Optional, up to 500 characters; required for adjustments |
+| `reference` | Optional, up to 120 characters (e.g. a PO or order number) |
+| `occurredAt` | Optional ISO 8601 date-time with a time zone, not in the future; defaults to now |
+| `correctsEventId` | Required for corrections, not allowed otherwise; must be an event for the same SKU and warehouse |
+
+Responses:
+
+- `201` with `{ "data": event }` and `Idempotent-Replayed: false` for a new movement.
+- `200` with the original event and `Idempotent-Replayed: true` when the same
+  key is retried with the same body, so a retried request never counts stock
+  twice.
+- `409 idempotency_conflict` when the key was already used for a different
+  movement.
+- `409 insufficient_stock` when the movement would take on-hand stock below
+  zero (see below). Nothing is recorded; the error says how much is on hand.
+- `422` for invalid fields, or a SKU, warehouse or corrected event that is
+  not in this organization.
+
+## Stock balances
+
+Migration `0005_stock_balances` adds `stock_balances`, one row per SKU and
+warehouse with the current `on_hand` quantity. It is a projection of the
+ledger: an `AFTER INSERT` trigger on `inventory_events` updates it in the same
+transaction as the event, so the two cannot drift apart. The migration
+backfills balances for events recorded before it, and the
+`stock_balance_drift` view lists any balance that differs from the sum of its
+events (it should always be empty).
+
+**Negative-stock rule:** `on_hand` can never go below zero. An issue, negative
+adjustment or correction that would do so fails as a whole and returns
+`409 insufficient_stock`. Concurrent movements for the same SKU and warehouse
+are serialized by the balance row lock, so two issues cannot both spend the
+same stock. The rule checks the current total; a back-dated `occurredAt` is
+not replayed against older balances.
+
+### `GET /v1/organizations/:orgId/inventory`
+
+Any member (`viewer` and up). Lists balances with SKU and warehouse details,
+ordered by SKU code then warehouse code. Archived SKUs and warehouses are left
+out.
+
+| Query parameter | Notes |
+|---|---|
+| `skuId`, `warehouseId` | Optional UUID filters |
+| `limit` | 1–500, default 100 |
+| `offset` | 0–100000, default 0 |
+
+Each balance has `skuId`, `skuCode`, `skuName`, `unit`, `warehouseId`,
+`warehouseCode`, `warehouseName`, `onHand`, `reorderPoint`,
+`atOrBelowReorderPoint`, `eventCount`, `lastEventId`, `lastMovementAt` and
+`updatedAt`. The response is `{ "data": [...], "page": { "skuId", "warehouseId",
+"limit", "offset", "hasMore" } }`. Unknown or invalid query parameters return
+`422`.
+
+## CSV imports
+
+Migration `0006_import_batches` adds `import_batches` and `import_rows`.
+Uploading a CSV of stock movements stores a **preview**: every data row with
+its original cells, the values picked out by the column mapping and either the
+movement it would record or the reasons it cannot. Nothing is written to the
+stock ledger at this stage.
+
+### `POST /v1/organizations/:orgId/imports`
+
+Needs `manager`. JSON body:
+
+| Field | Notes |
+|---|---|
+| `fileName` | Up to 255 characters, shown back in the batch |
+| `content` | The CSV text. The JSON body is limited to 100 kB; split bigger files |
+| `mapping` | Optional `{ field: "Column name" }`; `null` leaves a field out. Fields not given are matched automatically |
+| `defaultType` | Optional `receipt`, `issue` or `adjustment`, used when there is no type column or a type cell is empty |
+
+**Reading the file:** cells are separated by `,` or `;` (detected from the
+header line), quoted cells may hold delimiters, `""` and line breaks, and a
+UTF-8 byte order mark and blank lines are ignored. Limits: 2,000 data rows,
+30 columns, 500 characters per cell. Header names must be non-empty and
+unique (ignoring case). A file that breaks these rules is rejected with
+`422` on `content`, naming the row (`row 7: has a quoted cell that is never
+closed`).
+
+**Column mapping:** header names are compared lowercase with spaces and
+punctuation removed.
+
+| Field | Required | Matched automatically from |
+|---|---|---|
+| `skuCode` | yes | `sku code`, `sku`, `item code`, `item`, `product code`, `product` |
+| `warehouseCode` | yes | `warehouse code`, `warehouse`, `location code`, `location`, `site` |
+| `quantity` | yes | `quantity`, `qty`, `units` |
+| `type` | no | `type`, `movement type`, `movement`, `event type` |
+| `reason` | no | `reason`, `note`, `notes`, `comment` |
+| `reference` | no | `reference`, `ref`, `po number`, `po`, `order number`, `document` |
+| `occurredAt` | no | `occurred at`, `occurred`, `date`, `datetime`, `timestamp` |
+
+A required field without a column, a column that is not in the file or one
+column used for two fields is a `422` on `mapping.<field>`.
+
+**Row checks** follow the movement endpoint: SKU and warehouse codes must be
+active records of this organization (case-insensitive), the type must be
+`receipt`, `issue` or `adjustment` (corrections need an event id and are
+recorded one by one), receipts and issues take a whole number ≥ 1,
+adjustments a signed non-zero one with a `reason`, and `occurredAt` is an ISO
+8601 date-time with a time zone or a plain date (`2026-11-19`, read as
+midnight UTC), not in the future. A row whose cell count differs from the
+header is invalid too. Invalid rows do not fail the upload.
+
+`201` returns the batch (`id`, `fileName`, `fileSha256`, `delimiter`,
+`columns`, `mapping`, `defaultType`, `status: "previewed"`, `rowCount`,
+`validCount`, `invalidCount`, `createdBy`, `createdAt`) with the first 50
+rows in `data.rows`. Each row has `rowNumber` (the header is row 1),
+`status` (`valid` or `invalid`), `cells`, `values`, `movement` (with resolved
+`skuId`, `warehouseId` and signed `quantityDelta`, or `null`) and `errors`.
+
+### `GET /v1/organizations/:orgId/imports/:importId`
+
+Any member. The batch with a page of its rows in file order.
+
+| Query parameter | Notes |
+|---|---|
+| `status` | Optional `valid` or `invalid` |
+| `limit` | 1–500, default 50 |
+| `offset` | 0–2000, default 0 |
+| `outcome` | Optional `applied`, `duplicate` or `rejected` (rows of an applied batch) |
+
+`404` for an import of another organization.
+
+### `POST /v1/organizations/:orgId/imports/:importId/apply`
+
+Needs `manager`. Migration `0007_import_apply_jobs` adds the apply states.
+Applying runs as a background job: the request only queues the batch and
+answers `202` with it in `queued`.
+
+```
+previewed -> queued -> applying -> applied
+                ^          |
+                +- failed <+
+```
+
+The **import worker** runs inside the API process. Every
+`IMPORT_WORKER_POLL_MS` it claims the oldest queued batch with
+`FOR UPDATE SKIP LOCKED`, so several API instances can poll the same table
+without taking the same batch. A batch left in `applying` for longer than
+`IMPORT_STALE_AFTER_SECONDS` is taken over by another worker; each claim
+bumps `apply.attempts`, and only the latest attempt can write outcomes or
+close the batch.
+
+The worker records every valid row through the stock ledger, in file order
+and as the user who asked to apply, and stores the outcome on the row:
+
+| `outcome.outcome` | Meaning |
+|---|---|
+| `applied` | Recorded; `outcome.eventId` is the new ledger event |
+| `duplicate` | Not recorded: same movement as an earlier row of the file (`outcome.duplicateOfRow`), or already in the ledger (`outcome.eventId`) |
+| `rejected` | The ledger refused it; `outcome.message` says why (not enough stock, SKU or warehouse archived since the preview) |
+
+**Deduplication.** Two rows are the same movement when SKU, warehouse, type,
+quantity, reason, reference and `occurredAt` all match. A row without a date
+is stamped with the upload time, so its movement is fixed by the batch. Each
+row is recorded with the idempotency key `import:<SHA-256 of the movement>`:
+importing a dated movement again, from the same file or another one, finds
+the existing event instead of recording it twice. Undated rows of a file
+uploaded again count as new movements (they get a new upload time). Add a
+date or reference column to files where identical lines are really separate
+movements.
+
+Rejected rows do not stop the batch. An unexpected error (for example the
+database going away) stops the attempt and marks the batch `failed` with
+`apply.failureReason`; applying it again resumes after the last row with an
+outcome. When every valid row has an outcome the batch is `applied`, with
+`apply.appliedCount`, `apply.duplicateCount` and `apply.rejectedCount`.
+
+Every batch response carries `apply` (`requestedBy`, `queuedAt`, `startedAt`,
+`finishedAt`, `attempts`, the three counts and `failureReason`). Rows carry
+`outcome`: `null` until applied, and always `null` for invalid rows.
+
+| Response | When |
+|---|---|
+| `202` | Queued, or already `queued`/`applying` (nothing changes) |
+| `404` | Unknown import or one of another organization |
+| `409 import_already_applied` | The batch was applied already |
+| `422 nothing_to_apply` | The batch has no valid rows |
+
 ## Errors
 
 Every error response has the same shape:
@@ -95,8 +300,8 @@ Every error response has the same shape:
 | 401 | `unauthorized` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
-| 409 | `duplicate_code` |
-| 422 | `validation_failed` (with `details`) |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied` |
+| 422 | `validation_failed` (with `details`), `nothing_to_apply` |
 | 500 | `internal_error` |
 
 Each request gets a correlation id: the caller's `X-Request-Id` if it is 8–128
@@ -104,6 +309,28 @@ characters of letters, digits, `.`, `_` or `-`, otherwise a new UUID. It is
 returned in the `X-Request-Id` header and in `error.requestId`. Unexpected
 errors are logged with that id; their details are never sent to the client.
 `GET /v1/health` keeps its own report body for both `200` and `503`.
+
+## Tests
+
+`pnpm --filter @supplypilot/api test` runs the unit and HTTP specs. They use
+fake repositories and need no database.
+
+Specs named `*.db.spec.ts` run the repositories against a real PostgreSQL and
+are skipped unless `TEST_DATABASE_URL` is set. Each run applies the migrations
+to a new throwaway schema and drops it at the end, so the local development
+database is fine:
+
+```bash
+pnpm services:up
+TEST_DATABASE_URL=postgres://supplypilot:supplypilot_local@localhost:5432/supplypilot \
+  pnpm --filter @supplypilot/api test:db
+```
+
+`inventory-ledger.db.spec.ts` covers retried and concurrent requests with the
+same `Idempotency-Key` (one event, the rest replayed), key conflicts and
+per-organization keys, the negative-stock rule for issues, adjustments and
+corrections, concurrent issues racing for the same stock, and the
+append-only ledger with an empty `stock_balance_drift` view.
 
 ## Migrations
 

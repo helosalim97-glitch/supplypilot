@@ -9,7 +9,8 @@
     "dev": "ts-node src/main.ts",
     "migrate": "ts-node src/migrations/cli.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "jest"
+    "test": "jest",
+    "test:db": "jest db.spec"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.4",
