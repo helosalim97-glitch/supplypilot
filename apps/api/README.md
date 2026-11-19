@@ -170,7 +170,7 @@ Every error response has the same shape:
 | 401 | `unauthorized` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
-| 409 | `duplicate_code`, `idempotency_conflict` |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock` |
 | 422 | `validation_failed` (with `details`) |
 | 500 | `internal_error` |
 
@@ -179,6 +179,28 @@ characters of letters, digits, `.`, `_` or `-`, otherwise a new UUID. It is
 returned in the `X-Request-Id` header and in `error.requestId`. Unexpected
 errors are logged with that id; their details are never sent to the client.
 `GET /v1/health` keeps its own report body for both `200` and `503`.
+
+## Tests
+
+`pnpm --filter @supplypilot/api test` runs the unit and HTTP specs. They use
+fake repositories and need no database.
+
+Specs named `*.db.spec.ts` run the repositories against a real PostgreSQL and
+are skipped unless `TEST_DATABASE_URL` is set. Each run applies the migrations
+to a new throwaway schema and drops it at the end, so the local development
+database is fine:
+
+```bash
+pnpm services:up
+TEST_DATABASE_URL=postgres://supplypilot:supplypilot_local@localhost:5432/supplypilot \
+  pnpm --filter @supplypilot/api test:db
+```
+
+`inventory-ledger.db.spec.ts` covers retried and concurrent requests with the
+same `Idempotency-Key` (one event, the rest replayed), key conflicts and
+per-organization keys, the negative-stock rule for issues, adjustments and
+corrections, concurrent issues racing for the same stock, and the
+append-only ledger with an empty `stock_balance_drift` view.
 
 ## Migrations
 
