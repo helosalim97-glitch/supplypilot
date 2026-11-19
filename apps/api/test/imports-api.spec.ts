@@ -66,6 +66,15 @@ const batchRow: ImportBatchRow = {
   valid_count: 1,
   created_by: USER,
   created_at: new Date('2026-11-19T09:00:00.000Z'),
+  applied_by: null,
+  queued_at: null,
+  started_at: null,
+  finished_at: null,
+  attempts: 0,
+  applied_count: 0,
+  duplicate_count: 0,
+  rejected_count: 0,
+  failure_reason: null,
 };
 
 describe('parseNewImport', () => {
@@ -148,6 +157,7 @@ describe('ImportsRepository', () => {
         occurredAt: null,
       },
       errors: [],
+      outcome: null,
     };
     const invalid: ImportRow = {
       ...valid,
@@ -182,10 +192,15 @@ describe('ImportsRepository', () => {
 
   it('filters rows by status and fetches one extra row to detect another page', async () => {
     const pool = fakePool([]);
-    await repoWith(pool).listRows(ORG, BATCH, { status: 'invalid', limit: 50, offset: 100 });
+    await repoWith(pool).listRows(ORG, BATCH, {
+      status: 'invalid',
+      outcome: null,
+      limit: 50,
+      offset: 100,
+    });
     const [sql, params] = pool.query.mock.calls[0];
     expect(sql).toMatch(/WHERE organization_id = \$1 AND batch_id = \$2/);
-    expect(params).toEqual([ORG, BATCH, 'invalid', 51, 100]);
+    expect(params).toEqual([ORG, BATCH, 'invalid', null, 51, 100]);
   });
 });
 
@@ -256,7 +271,13 @@ describe('imports API', () => {
     expect(res.body.data.rows[2].errors).toEqual([
       { field: 'skuCode', message: '"SKU-404" is not an active SKU code in this organization' },
     ]);
-    expect(res.body.page).toEqual({ status: null, limit: 50, offset: 0, hasMore: false });
+    expect(res.body.page).toEqual({
+      status: null,
+      outcome: null,
+      limit: 50,
+      offset: 0,
+      hasMore: false,
+    });
   });
 
   it('returns 422 and stores nothing when the file cannot be read', async () => {
@@ -320,12 +341,13 @@ describe('imports API', () => {
     expect(imports.findBatch).toHaveBeenCalledWith(ORG, BATCH);
     expect(imports.listRows).toHaveBeenCalledWith(ORG, BATCH, {
       status: 'invalid',
+      outcome: null,
       limit: 1,
       offset: 0,
     });
     expect(res.body).toEqual({
       data: { id: BATCH, rowCount: 3, rows: [{ rowNumber: 3 }] },
-      page: { status: 'invalid', limit: 1, offset: 0, hasMore: true },
+      page: { status: 'invalid', outcome: null, limit: 1, offset: 0, hasMore: true },
     });
   });
 
@@ -343,11 +365,12 @@ describe('imports API', () => {
 
   it('returns 422 for invalid row filters', async () => {
     const res = await request(app.getHttpServer())
-      .get(`/v1/organizations/${ORG}/imports/${BATCH}?status=pending&limit=0`)
+      .get(`/v1/organizations/${ORG}/imports/${BATCH}?status=pending&outcome=done&limit=0`)
       .set('Authorization', 'Bearer viewer-token-0123456789')
       .expect(422);
     expect(res.body.error.details.map((d: { field: string }) => d.field)).toEqual([
       'status',
+      'outcome',
       'limit',
     ]);
   });

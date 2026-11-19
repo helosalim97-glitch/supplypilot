@@ -16,3 +16,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
 
   return { port, databaseUrl };
 }
+
+export interface ImportWorkerConfig {
+  /** How often the import worker looks for queued imports; 0 turns it off. */
+  pollMs: number;
+  /** An import `applying` for longer than this is taken over by another worker. */
+  staleAfterSeconds: number;
+}
+
+export function loadImportWorkerConfig(env: NodeJS.ProcessEnv = process.env): ImportWorkerConfig {
+  const read = (name: string, fallback: number, min: number, max: number): number => {
+    const raw = env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const value = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    if (!(value >= min && value <= max)) {
+      throw new Error(`${name} must be a whole number from ${min} to ${max}, got "${raw}"`);
+    }
+    return value;
+  };
+  return {
+    pollMs: read('IMPORT_WORKER_POLL_MS', 2000, 0, 60_000),
+    staleAfterSeconds: read('IMPORT_STALE_AFTER_SECONDS', 600, 30, 86_400),
+  };
+}

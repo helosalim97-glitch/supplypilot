@@ -150,6 +150,7 @@ export function previewRow(
         }
       : null,
     errors,
+    outcome: null,
   };
 }
 

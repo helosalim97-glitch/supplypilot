@@ -177,6 +177,7 @@ describe('previewRows', () => {
         occurredAt: '2026-11-18T00:00:00.000Z',
       },
       errors: [],
+      outcome: null,
     });
   });
 

@@ -1,4 +1,14 @@
-import { Body, Controller, Get, HttpStatus, Param, Post, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { Auth, type AuthContext } from '../auth/auth.context';
 import { RequireRole } from '../auth/require-role.decorator';
@@ -29,7 +39,8 @@ function notFound(): ApiError {
 /**
  * CSV imports of stock movements. Uploading a file stores a preview: every
  * row checked against the catalog and the movement rules, with errors per
- * row. Nothing is written to the stock ledger here.
+ * row. Nothing is written to the stock ledger until the batch is applied,
+ * which queues it for the import worker (see ImportWorker).
  */
 @Controller('v1/organizations/:orgId/imports')
 @UseGuards(TenantGuard)
@@ -77,7 +88,7 @@ export class ImportsController {
       defaultType: input.defaultType,
       rows,
     });
-    const page = { status: null, limit: DEFAULT_ROW_LIMIT, offset: 0 };
+    const page = { status: null, outcome: null, limit: DEFAULT_ROW_LIMIT, offset: 0 };
     return {
       data: { ...batch, rows: rows.slice(0, page.limit) },
       page: { ...page, hasMore: rows.length > page.limit },
@@ -99,5 +110,36 @@ export class ImportsController {
     if (!batch) throw notFound();
     const { rows, hasMore } = await this.imports.listRows(organizationId, batch.id, page);
     return { data: { ...batch, rows }, page: { ...page, hasMore } };
+  }
+
+  /**
+   * Queues the batch for the import worker: `202` with the batch in
+   * `queued`. A failed batch can be queued again and resumes where it
+   * stopped. Asking again while it is queued or applying is a no-op `202`;
+   * an applied batch is a `409`, and one without valid rows a `422`.
+   */
+  @Post(':importId/apply')
+  @RequireRole('manager')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async apply(
+    @Auth() auth: AuthContext,
+    @Param('importId') importId: string,
+  ): Promise<{ data: ImportBatch }> {
+    const organizationId = auth.organizationId as string;
+    if (!isUuid(importId)) throw notFound();
+    const queued = await this.imports.requestApply(organizationId, importId, auth.userId);
+    if (queued) return { data: queued };
+
+    const batch = await this.imports.findBatch(organizationId, importId);
+    if (!batch) throw notFound();
+    if (batch.status === 'queued' || batch.status === 'applying') return { data: batch };
+    if (batch.status === 'applied') {
+      throw new ApiError(HttpStatus.CONFLICT, 'import_already_applied', 'Import was already applied');
+    }
+    throw new ApiError(
+      HttpStatus.UNPROCESSABLE_ENTITY,
+      'nothing_to_apply',
+      'Import has no valid rows to apply',
+    );
   }
 }

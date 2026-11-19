@@ -8,6 +8,8 @@ import {
   type ImportField,
   type ImportRowQuery,
   type NewImport,
+  ROW_OUTCOMES,
+  type RowOutcomeKind,
 } from './imports.models';
 
 /*
@@ -98,11 +100,11 @@ export function parseNewImport(body: unknown): NewImport {
   return { fileName, content: content as string, mapping, defaultType };
 }
 
-const ROW_QUERY_FIELDS = ['status', 'limit', 'offset'];
+const ROW_QUERY_FIELDS = ['status', 'outcome', 'limit', 'offset'];
 export const DEFAULT_ROW_LIMIT = 50;
 const MAX_ROW_LIMIT = 500;
 
-/** Query string of `GET .../imports/:importId`: optional status filter and paging. */
+/** Query string of `GET .../imports/:importId`: optional status/outcome filters and paging. */
 export function parseImportRowQuery(query: unknown): ImportRowQuery {
   const input: Record<string, unknown> = isPlainObject(query) ? query : {};
   const errors: FieldError[] = [];
@@ -119,6 +121,16 @@ export function parseImportRowQuery(query: unknown): ImportRowQuery {
     else errors.push({ field: 'status', message: 'must be valid or invalid' });
   }
 
+  let outcome: RowOutcomeKind | null = null;
+  const rawOutcome = input.outcome;
+  if (rawOutcome !== undefined) {
+    if ((ROW_OUTCOMES as readonly unknown[]).includes(rawOutcome)) {
+      outcome = rawOutcome as RowOutcomeKind;
+    } else {
+      errors.push({ field: 'outcome', message: `must be one of: ${ROW_OUTCOMES.join(', ')}` });
+    }
+  }
+
   const int = (field: string, min: number, max: number, fallback: number): number => {
     const value = input[field];
     if (value === undefined) return fallback;
@@ -133,5 +145,5 @@ export function parseImportRowQuery(query: unknown): ImportRowQuery {
   const offset = int('offset', 0, CSV_LIMITS.maxRows, 0);
 
   if (errors.length > 0) throw new ValidationError(errors);
-  return { status, limit, offset };
+  return { status, outcome, limit, offset };
 }

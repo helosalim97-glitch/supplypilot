@@ -15,6 +15,8 @@ pnpm api:dev                  # http://localhost:3001/v1/health
 |---|---|---|
 | `API_PORT` | `3001` | HTTP port |
 | `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `IMPORT_WORKER_POLL_MS` | `2000` | How often the import worker looks for queued imports (0–60000; `0` turns it off) |
+| `IMPORT_STALE_AFTER_SECONDS` | `600` | An import stuck in `applying` this long is taken over (30–86400) |
 
 ## Health
 
@@ -218,8 +220,65 @@ Any member. The batch with a page of its rows in file order.
 | `status` | Optional `valid` or `invalid` |
 | `limit` | 1–500, default 50 |
 | `offset` | 0–2000, default 0 |
+| `outcome` | Optional `applied`, `duplicate` or `rejected` (rows of an applied batch) |
 
 `404` for an import of another organization.
+
+### `POST /v1/organizations/:orgId/imports/:importId/apply`
+
+Needs `manager`. Migration `0007_import_apply_jobs` adds the apply states.
+Applying runs as a background job: the request only queues the batch and
+answers `202` with it in `queued`.
+
+```
+previewed -> queued -> applying -> applied
+                ^          |
+                +- failed <+
+```
+
+The **import worker** runs inside the API process. Every
+`IMPORT_WORKER_POLL_MS` it claims the oldest queued batch with
+`FOR UPDATE SKIP LOCKED`, so several API instances can poll the same table
+without taking the same batch. A batch left in `applying` for longer than
+`IMPORT_STALE_AFTER_SECONDS` is taken over by another worker; each claim
+bumps `apply.attempts`, and only the latest attempt can write outcomes or
+close the batch.
+
+The worker records every valid row through the stock ledger, in file order
+and as the user who asked to apply, and stores the outcome on the row:
+
+| `outcome.outcome` | Meaning |
+|---|---|
+| `applied` | Recorded; `outcome.eventId` is the new ledger event |
+| `duplicate` | Not recorded: same movement as an earlier row of the file (`outcome.duplicateOfRow`), or already in the ledger (`outcome.eventId`) |
+| `rejected` | The ledger refused it; `outcome.message` says why (not enough stock, SKU or warehouse archived since the preview) |
+
+**Deduplication.** Two rows are the same movement when SKU, warehouse, type,
+quantity, reason, reference and `occurredAt` all match. A row without a date
+is stamped with the upload time, so its movement is fixed by the batch. Each
+row is recorded with the idempotency key `import:<SHA-256 of the movement>`:
+importing a dated movement again, from the same file or another one, finds
+the existing event instead of recording it twice. Undated rows of a file
+uploaded again count as new movements (they get a new upload time). Add a
+date or reference column to files where identical lines are really separate
+movements.
+
+Rejected rows do not stop the batch. An unexpected error (for example the
+database going away) stops the attempt and marks the batch `failed` with
+`apply.failureReason`; applying it again resumes after the last row with an
+outcome. When every valid row has an outcome the batch is `applied`, with
+`apply.appliedCount`, `apply.duplicateCount` and `apply.rejectedCount`.
+
+Every batch response carries `apply` (`requestedBy`, `queuedAt`, `startedAt`,
+`finishedAt`, `attempts`, the three counts and `failureReason`). Rows carry
+`outcome`: `null` until applied, and always `null` for invalid rows.
+
+| Response | When |
+|---|---|
+| `202` | Queued, or already `queued`/`applying` (nothing changes) |
+| `404` | Unknown import or one of another organization |
+| `409 import_already_applied` | The batch was applied already |
+| `422 nothing_to_apply` | The batch has no valid rows |
 
 ## Errors
 
@@ -241,8 +300,8 @@ Every error response has the same shape:
 | 401 | `unauthorized` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
-| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock` |
-| 422 | `validation_failed` (with `details`) |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied` |
+| 422 | `validation_failed` (with `details`), `nothing_to_apply` |
 | 500 | `internal_error` |
 
 Each request gets a correlation id: the caller's `X-Request-Id` if it is 8–128

@@ -48,6 +48,21 @@ export interface ImportedMovement {
   occurredAt: string | null;
 }
 
+/** What applying did with a valid row; invalid rows are never applied. */
+export type RowOutcomeKind = 'applied' | 'duplicate' | 'rejected';
+
+export const ROW_OUTCOMES: readonly RowOutcomeKind[] = ['applied', 'duplicate', 'rejected'];
+
+export interface RowOutcome {
+  outcome: RowOutcomeKind;
+  /** applied: the recorded event; duplicate: the event already in the ledger. */
+  eventId: string | null;
+  /** duplicate: the earlier row of the same file with the same movement. */
+  duplicateOfRow: number | null;
+  /** Why a row was skipped or rejected. */
+  message: string | null;
+}
+
 export interface ImportRow {
   rowNumber: number;
   status: 'valid' | 'invalid';
@@ -57,9 +72,11 @@ export interface ImportRow {
   values: Partial<Record<ImportField, string>>;
   movement: ImportedMovement | null;
   errors: FieldError[];
+  /** null until the row has been applied (and always for invalid rows). */
+  outcome: RowOutcome | null;
 }
 
-export type ImportStatus = 'previewed';
+export type ImportStatus = 'previewed' | 'queued' | 'applying' | 'applied' | 'failed';
 
 export interface ImportBatch {
   id: string;
@@ -77,6 +94,20 @@ export interface ImportBatch {
   invalidCount: number;
   createdBy: string;
   createdAt: string;
+  apply: ImportApplyState;
+}
+
+/** Progress of applying the batch; all null/zero while it is only previewed. */
+export interface ImportApplyState {
+  requestedBy: string | null;
+  queuedAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  attempts: number;
+  appliedCount: number;
+  duplicateCount: number;
+  rejectedCount: number;
+  failureReason: string | null;
 }
 
 /** Everything needed to store a previewed batch. */
@@ -92,6 +123,7 @@ export interface ImportDraft {
 
 export interface ImportRowQuery {
   status: 'valid' | 'invalid' | null;
+  outcome: RowOutcomeKind | null;
   limit: number;
   offset: number;
 }
@@ -111,7 +143,18 @@ export interface ImportBatchRow {
   valid_count: number;
   created_by: string;
   created_at: Date;
+  applied_by: string | null;
+  queued_at: Date | null;
+  started_at: Date | null;
+  finished_at: Date | null;
+  attempts: number;
+  applied_count: number;
+  duplicate_count: number;
+  rejected_count: number;
+  failure_reason: string | null;
 }
+
+const iso = (value: Date | null): string | null => (value ? value.toISOString() : null);
 
 export function toImportBatch(row: ImportBatchRow): ImportBatch {
   return {
@@ -130,6 +173,17 @@ export function toImportBatch(row: ImportBatchRow): ImportBatch {
     invalidCount: row.row_count - row.valid_count,
     createdBy: row.created_by,
     createdAt: row.created_at.toISOString(),
+    apply: {
+      requestedBy: row.applied_by,
+      queuedAt: iso(row.queued_at),
+      startedAt: iso(row.started_at),
+      finishedAt: iso(row.finished_at),
+      attempts: row.attempts,
+      appliedCount: row.applied_count,
+      duplicateCount: row.duplicate_count,
+      rejectedCount: row.rejected_count,
+      failureReason: row.failure_reason,
+    },
   };
 }
 
@@ -145,6 +199,10 @@ export interface ImportRowRecord {
   reference: string | null;
   occurred_at: Date | null;
   errors: FieldError[];
+  outcome?: RowOutcomeKind | null;
+  event_id?: string | null;
+  duplicate_of_row?: number | null;
+  outcome_message?: string | null;
 }
 
 export function toImportRow(row: ImportRowRecord): ImportRow {
@@ -162,10 +220,18 @@ export function toImportRow(row: ImportRowRecord): ImportRow {
           quantityDelta: row.quantity_delta as number,
           reason: row.reason,
           reference: row.reference,
-          occurredAt: row.occurred_at ? row.occurred_at.toISOString() : null,
+          occurredAt: iso(row.occurred_at),
         }
       : null,
     errors: row.errors,
+    outcome: row.outcome
+      ? {
+          outcome: row.outcome,
+          eventId: row.event_id ?? null,
+          duplicateOfRow: row.duplicate_of_row ?? null,
+          message: row.outcome_message ?? null,
+        }
+      : null,
   };
 }
 
