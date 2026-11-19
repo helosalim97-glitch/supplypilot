@@ -1,6 +1,11 @@
 import { isUuid } from '../catalog/catalog.validation';
 import { ValidationError, type FieldError } from '../http/api-error';
-import { MOVEMENT_TYPES, type MovementType, type NewMovement } from './inventory.models';
+import {
+  MOVEMENT_TYPES,
+  type BalanceQuery,
+  type MovementType,
+  type NewMovement,
+} from './inventory.models';
 
 /*
  * Validation for `POST .../inventory/movements`. Rules mirror the CHECK
@@ -159,4 +164,50 @@ export function parseNewMovement(body: unknown, now: Date = new Date()): NewMove
     correctsEventId,
     occurredAt: occurred,
   };
+}
+
+const BALANCE_QUERY_FIELDS = ['skuId', 'warehouseId', 'limit', 'offset'];
+export const DEFAULT_BALANCE_LIMIT = 100;
+export const MAX_BALANCE_LIMIT = 500;
+const MAX_OFFSET = 100_000;
+
+/** A whole number from a query-string value, or the fallback when absent. */
+function queryInt(
+  query: Record<string, unknown>,
+  field: string,
+  min: number,
+  max: number,
+  fallback: number,
+  errors: FieldError[],
+): number {
+  const value = query[field];
+  if (value === undefined) return fallback;
+  const n = typeof value === 'string' && /^\d{1,7}$/.test(value) ? Number(value) : NaN;
+  if (!(n >= min && n <= max)) {
+    errors.push({ field, message: `must be a whole number from ${min} to ${max}` });
+    return fallback;
+  }
+  return n;
+}
+
+/** Query string of `GET .../inventory`: optional SKU/warehouse filters and paging. */
+export function parseBalanceQuery(query: unknown): BalanceQuery {
+  const input =
+    typeof query === 'object' && query !== null ? (query as Record<string, unknown>) : {};
+  const errors: FieldError[] = [];
+  for (const key of Object.keys(input)) {
+    if (!BALANCE_QUERY_FIELDS.includes(key)) {
+      errors.push({ field: key, message: 'is not an allowed query parameter' });
+    }
+  }
+  const filter = (field: string): string | null =>
+    input[field] === undefined ? null : uuid(input, field, errors) || null;
+
+  const skuId = filter('skuId');
+  const warehouseId = filter('warehouseId');
+  const limit = queryInt(input, 'limit', 1, MAX_BALANCE_LIMIT, DEFAULT_BALANCE_LIMIT, errors);
+  const offset = queryInt(input, 'offset', 0, MAX_OFFSET, 0, errors);
+
+  if (errors.length > 0) throw new ValidationError(errors);
+  return { skuId, warehouseId, limit, offset };
 }
