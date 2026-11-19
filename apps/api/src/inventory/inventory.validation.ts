@@ -51,7 +51,7 @@ function isMovementType(value: unknown): value is MovementType {
   return typeof value === 'string' && (MOVEMENT_TYPES as readonly string[]).includes(value);
 }
 
-function optionalText(
+export function optionalText(
   body: Record<string, unknown>,
   field: string,
   maxLength: number,
@@ -83,7 +83,7 @@ function uuid(body: Record<string, unknown>, field: string, errors: FieldError[]
  * Receipts and issues take a positive `quantity` and the sign comes from the
  * type. Adjustments and corrections take a signed, non-zero `quantity`.
  */
-function quantityDelta(type: MovementType | null, value: unknown, errors: FieldError[]): number {
+export function quantityDelta(type: MovementType | null, value: unknown, errors: FieldError[]): number {
   const n = typeof value === 'number' && Number.isInteger(value) ? value : NaN;
   if (type === 'receipt' || type === 'issue') {
     if (!(n >= 1 && n <= MAX_INT)) {
@@ -102,7 +102,11 @@ function quantityDelta(type: MovementType | null, value: unknown, errors: FieldE
   return n;
 }
 
-function occurredAt(value: unknown, now: Date, errors: FieldError[]): string | null {
+export function parseOccurredAt(
+  value: unknown,
+  now: Date,
+  errors: FieldError[],
+): string | null {
   if (value === undefined || value === null) return null;
   const time = typeof value === 'string' && TIMESTAMP_PATTERN.test(value) ? Date.parse(value) : NaN;
   if (Number.isNaN(time)) {
@@ -139,7 +143,7 @@ export function parseNewMovement(body: unknown, now: Date = new Date()): NewMove
   const delta = quantityDelta(type, input.quantity, errors);
   const reason = optionalText(input, 'reason', 500, errors);
   const reference = optionalText(input, 'reference', 120, errors);
-  const occurred = occurredAt(input.occurredAt, now, errors);
+  const occurred = parseOccurredAt(input.occurredAt, now, errors);
 
   let correctsEventId: string | null = null;
   const target = input.correctsEventId;

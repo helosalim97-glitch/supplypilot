@@ -150,6 +150,77 @@ Each balance has `skuId`, `skuCode`, `skuName`, `unit`, `warehouseId`,
 "limit", "offset", "hasMore" } }`. Unknown or invalid query parameters return
 `422`.
 
+## CSV imports
+
+Migration `0006_import_batches` adds `import_batches` and `import_rows`.
+Uploading a CSV of stock movements stores a **preview**: every data row with
+its original cells, the values picked out by the column mapping and either the
+movement it would record or the reasons it cannot. Nothing is written to the
+stock ledger at this stage.
+
+### `POST /v1/organizations/:orgId/imports`
+
+Needs `manager`. JSON body:
+
+| Field | Notes |
+|---|---|
+| `fileName` | Up to 255 characters, shown back in the batch |
+| `content` | The CSV text. The JSON body is limited to 100 kB; split bigger files |
+| `mapping` | Optional `{ field: "Column name" }`; `null` leaves a field out. Fields not given are matched automatically |
+| `defaultType` | Optional `receipt`, `issue` or `adjustment`, used when there is no type column or a type cell is empty |
+
+**Reading the file:** cells are separated by `,` or `;` (detected from the
+header line), quoted cells may hold delimiters, `""` and line breaks, and a
+UTF-8 byte order mark and blank lines are ignored. Limits: 2,000 data rows,
+30 columns, 500 characters per cell. Header names must be non-empty and
+unique (ignoring case). A file that breaks these rules is rejected with
+`422` on `content`, naming the row (`row 7: has a quoted cell that is never
+closed`).
+
+**Column mapping:** header names are compared lowercase with spaces and
+punctuation removed.
+
+| Field | Required | Matched automatically from |
+|---|---|---|
+| `skuCode` | yes | `sku code`, `sku`, `item code`, `item`, `product code`, `product` |
+| `warehouseCode` | yes | `warehouse code`, `warehouse`, `location code`, `location`, `site` |
+| `quantity` | yes | `quantity`, `qty`, `units` |
+| `type` | no | `type`, `movement type`, `movement`, `event type` |
+| `reason` | no | `reason`, `note`, `notes`, `comment` |
+| `reference` | no | `reference`, `ref`, `po number`, `po`, `order number`, `document` |
+| `occurredAt` | no | `occurred at`, `occurred`, `date`, `datetime`, `timestamp` |
+
+A required field without a column, a column that is not in the file or one
+column used for two fields is a `422` on `mapping.<field>`.
+
+**Row checks** follow the movement endpoint: SKU and warehouse codes must be
+active records of this organization (case-insensitive), the type must be
+`receipt`, `issue` or `adjustment` (corrections need an event id and are
+recorded one by one), receipts and issues take a whole number ≥ 1,
+adjustments a signed non-zero one with a `reason`, and `occurredAt` is an ISO
+8601 date-time with a time zone or a plain date (`2026-11-19`, read as
+midnight UTC), not in the future. A row whose cell count differs from the
+header is invalid too. Invalid rows do not fail the upload.
+
+`201` returns the batch (`id`, `fileName`, `fileSha256`, `delimiter`,
+`columns`, `mapping`, `defaultType`, `status: "previewed"`, `rowCount`,
+`validCount`, `invalidCount`, `createdBy`, `createdAt`) with the first 50
+rows in `data.rows`. Each row has `rowNumber` (the header is row 1),
+`status` (`valid` or `invalid`), `cells`, `values`, `movement` (with resolved
+`skuId`, `warehouseId` and signed `quantityDelta`, or `null`) and `errors`.
+
+### `GET /v1/organizations/:orgId/imports/:importId`
+
+Any member. The batch with a page of its rows in file order.
+
+| Query parameter | Notes |
+|---|---|
+| `status` | Optional `valid` or `invalid` |
+| `limit` | 1–500, default 50 |
+| `offset` | 0–2000, default 0 |
+
+`404` for an import of another organization.
+
 ## Errors
 
 Every error response has the same shape:
