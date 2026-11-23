@@ -39,6 +39,7 @@ Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
 | `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
 | Catalog routes (below) | Member of `:orgId`; writes need `manager` |
 | `POST /v1/organizations/:orgId/inventory/movements` | `manager` |
+| Purchase order routes (below) | Member of `:orgId`; creating and editing drafts needs `buyer` |
 
 `TenantGuard` runs on these routes. A missing or invalid token gets `401`.
 Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
@@ -280,6 +281,52 @@ Every batch response carries `apply` (`requestedBy`, `queuedAt`, `startedAt`,
 | `409 import_already_applied` | The batch was applied already |
 | `422 nothing_to_apply` | The batch has no valid rows |
 
+## Purchase orders
+
+Migration `0008_purchase_orders` adds `purchase_orders` and
+`purchase_order_lines`. An order is raised against one supplier for delivery
+to one warehouse; supplier, warehouse and SKUs must be active records of the
+same organization (composite foreign keys, checked and share-locked when the
+order is written). Orders are numbered per organization (`PO-000001`, ...)
+from `purchase_order_numbers`; the counter row lock keeps numbers unique when
+buyers create orders at the same time.
+
+Each line is one SKU (at most once per order) with `quantityOrdered`
+(1–1,000,000) and `unitCostCents`. The unit cost defaults to the SKU's
+catalog cost at the time the line is written, so later price changes don't
+rewrite existing orders. `lineTotalCents` is a generated column, capped at
+10^13 cents per line, so order totals are always exact numbers.
+
+New orders are `draft`. The status column already allows the later states
+(`submitted`, `approved`, `rejected`, `cancelled`, `partially_received`,
+`received`). A trigger only lets lines be added, removed or re-priced while
+the order is a draft. Orders and lines are never deleted.
+
+All routes are under `/v1/organizations/:orgId/purchase-orders`.
+
+| Route | Role | Notes |
+|---|---|---|
+| `GET /` | viewer | Newest first, without lines but with `lineCount`, `totalUnits`, `totalCents`; filters `status`, `supplierId`, `warehouseId`; `limit` 1–200 (default 50), `offset`, `page.hasMore` |
+| `GET /:id` | viewer | Order with its lines (SKU code, name and unit included); `404` for unknown, malformed or other-tenant ids |
+| `POST /` | buyer | Creates a draft: `supplierId`, `warehouseId`, optional `expectedOn` (`YYYY-MM-DD`) and `notes`, `lines` (1–200 of `{ skuId, quantity, unitCostCents? }`); `201` |
+| `PUT /:id/lines` | buyer | `{ lines }` replaces every line of a draft; `409 purchase_order_not_editable` once the order left draft |
+
+```json
+{
+  "supplierId": "1f4b…",
+  "warehouseId": "8a02…",
+  "expectedOn": "2026-12-04",
+  "lines": [
+    { "skuId": "c3d9…", "quantity": 400 },
+    { "skuId": "52ae…", "quantity": 24, "unitCostCents": 225 }
+  ]
+}
+```
+
+Invalid fields are reported with their line, e.g. `lines[1].quantity`. A SKU
+listed twice, or a supplier, warehouse or SKU that is archived or belongs to
+another organization, returns `422`.
+
 ## Errors
 
 Every error response has the same shape:
@@ -300,7 +347,7 @@ Every error response has the same shape:
 | 401 | `unauthorized` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
-| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied` |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied`, `purchase_order_not_editable` |
 | 422 | `validation_failed` (with `details`), `nothing_to_apply` |
 | 500 | `internal_error` |
 
