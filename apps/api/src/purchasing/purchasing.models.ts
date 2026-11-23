@@ -40,6 +40,13 @@ export interface PurchaseOrderSummary {
   expectedOn: string | null;
   notes: string | null;
   createdBy: string;
+  /** Who last submitted the order for approval and when; cleared on reopen. */
+  submittedBy: string | null;
+  submittedAt: string | null;
+  /** Who approved or rejected it, when, and the reason they gave. */
+  decidedBy: string | null;
+  decidedAt: string | null;
+  decisionReason: string | null;
   lineCount: number;
   totalUnits: number;
   totalCents: number;
@@ -89,6 +96,11 @@ export interface PurchaseOrderRow {
   expected_on: string | null;
   notes: string | null;
   created_by: string;
+  submitted_by: string | null;
+  submitted_at: Date | null;
+  decided_by: string | null;
+  decided_at: Date | null;
+  decision_reason: string | null;
   line_count: number;
   total_units: string | number;
   total_cents: string | number;
@@ -123,6 +135,11 @@ export function toPurchaseOrderSummary(row: PurchaseOrderRow): PurchaseOrderSumm
     expectedOn: row.expected_on,
     notes: row.notes,
     createdBy: row.created_by,
+    submittedBy: row.submitted_by,
+    submittedAt: row.submitted_at?.toISOString() ?? null,
+    decidedBy: row.decided_by,
+    decidedAt: row.decided_at?.toISOString() ?? null,
+    decisionReason: row.decision_reason,
     lineCount: row.line_count,
     totalUnits: Number(row.total_units),
     totalCents: Number(row.total_cents),
@@ -142,5 +159,48 @@ export function toPurchaseOrderLine(row: PurchaseOrderLineRow): PurchaseOrderLin
     quantityOrdered: row.quantity_ordered,
     unitCostCents: row.unit_cost_cents,
     lineTotalCents: Number(row.line_total_cents),
+  };
+}
+
+/** One entry of a record's audit trail. */
+export interface AuditEvent {
+  id: string;
+  entityType: string;
+  entityId: string;
+  /** e.g. `purchase_order.approved` */
+  action: string;
+  actorId: string;
+  fromStatus: string | null;
+  toStatus: string | null;
+  reason: string | null;
+  details: Record<string, unknown>;
+  occurredAt: string;
+}
+
+export interface AuditEventRow {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  action: string;
+  actor_id: string;
+  from_status: string | null;
+  to_status: string | null;
+  reason: string | null;
+  details: Record<string, unknown>;
+  occurred_at: Date;
+}
+
+export function toAuditEvent(row: AuditEventRow): AuditEvent {
+  return {
+    id: row.id,
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    action: row.action,
+    actorId: row.actor_id,
+    fromStatus: row.from_status,
+    toStatus: row.to_status,
+    reason: row.reason,
+    details: row.details,
+    occurredAt: row.occurred_at.toISOString(),
   };
 }

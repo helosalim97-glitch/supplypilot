@@ -6,6 +6,7 @@ import {
   parseLineReplacement,
   parseNewPurchaseOrder,
   parsePurchaseOrderQuery,
+  parseTransition,
 } from '../src/purchasing/purchasing.validation';
 
 const SUPPLIER = '6c1f2d3e-0000-4000-8000-000000000001';
@@ -155,4 +156,39 @@ describe('isCalendarDate', () => {
       expect(isCalendarDate(value)).toBe(false);
     },
   );
+});
+
+describe('parseTransition', () => {
+  it('accepts an empty or missing body where no reason is needed', () => {
+    expect(parseTransition('submit', undefined)).toEqual({ reason: null });
+    expect(parseTransition('approve', {})).toEqual({ reason: null });
+    expect(parseTransition('reopen', { reason: null })).toEqual({ reason: null });
+  });
+
+  it('trims the reason', () => {
+    expect(parseTransition('approve', { reason: '  Within Q4 budget ' })).toEqual({
+      reason: 'Within Q4 budget',
+    });
+  });
+
+  it('requires a reason to reject or cancel', () => {
+    for (const action of ['reject', 'cancel'] as const) {
+      expect(fieldsOf(() => parseTransition(action, {}))).toEqual(['reason']);
+      expect(parseTransition(action, { reason: 'Supplier price too high' }).reason).toBe(
+        'Supplier price too high',
+      );
+    }
+  });
+
+  it('reports a blank, over-long or non-string reason once', () => {
+    for (const reason of ['   ', 'x'.repeat(501), 42]) {
+      expect(fieldsOf(() => parseTransition('reject', { reason }))).toEqual(['reason']);
+    }
+    expect(parseTransition('approve', { reason: 'x'.repeat(500) }).reason).toHaveLength(500);
+  });
+
+  it('rejects unknown fields and non-object bodies', () => {
+    expect(fieldsOf(() => parseTransition('approve', { status: 'approved' }))).toEqual(['status']);
+    expect(fieldsOf(() => parseTransition('approve', ['reason']))).toEqual(['body']);
+  });
 });

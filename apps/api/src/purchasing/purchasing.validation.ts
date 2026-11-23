@@ -8,6 +8,7 @@ import {
   type PurchaseOrderQuery,
   type PurchaseOrderStatus,
 } from './purchasing.models';
+import { REASON_REQUIRED, type PurchaseOrderAction } from './purchasing.state-machine';
 
 /*
  * Validation for purchase order writes and list queries. The limits mirror
@@ -164,6 +165,30 @@ export function parseLineReplacement(body: unknown): NewPurchaseOrderLine[] {
   const lines = parseLines(input.lines, errors);
   if (errors.length > 0) throw new ValidationError(errors);
   return lines;
+}
+
+export const MAX_REASON_LENGTH = 500;
+const TRANSITION_FIELDS = ['reason'];
+
+/**
+ * Body of `POST .../purchase-orders/:id/{submit,approve,reject,cancel,reopen}`:
+ * an optional `reason`, required to reject or cancel. An empty body is fine
+ * where no reason is needed.
+ */
+export function parseTransition(
+  action: PurchaseOrderAction,
+  body: unknown,
+): { reason: string | null } {
+  const input = body === undefined || body === null ? {} : objectBody(body);
+  const errors: FieldError[] = [];
+  rejectUnknown(input, TRANSITION_FIELDS, '', errors);
+  const reason = optionalText(input, 'reason', MAX_REASON_LENGTH, errors);
+  const reasonInvalid = errors.some((e) => e.field === 'reason');
+  if (reason === null && REASON_REQUIRED.has(action) && !reasonInvalid) {
+    errors.push({ field: 'reason', message: `is required to ${action} a purchase order` });
+  }
+  if (errors.length > 0) throw new ValidationError(errors);
+  return { reason };
 }
 
 const QUERY_FIELDS = ['status', 'supplierId', 'warehouseId', 'limit', 'offset'];

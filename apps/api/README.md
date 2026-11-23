@@ -39,7 +39,7 @@ Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
 | `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
 | Catalog routes (below) | Member of `:orgId`; writes need `manager` |
 | `POST /v1/organizations/:orgId/inventory/movements` | `manager` |
-| Purchase order routes (below) | Member of `:orgId`; creating and editing drafts needs `buyer` |
+| Purchase order routes (below) | Member of `:orgId`; drafts, submitting, cancelling and reopening need `buyer`; approving and rejecting need `manager` |
 
 `TenantGuard` runs on these routes. A missing or invalid token gets `401`.
 Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
@@ -297,10 +297,8 @@ catalog cost at the time the line is written, so later price changes don't
 rewrite existing orders. `lineTotalCents` is a generated column, capped at
 10^13 cents per line, so order totals are always exact numbers.
 
-New orders are `draft`. The status column already allows the later states
-(`submitted`, `approved`, `rejected`, `cancelled`, `partially_received`,
-`received`). A trigger only lets lines be added, removed or re-priced while
-the order is a draft. Orders and lines are never deleted.
+New orders are `draft`. A trigger only lets lines be added, removed or
+re-priced while the order is a draft. Orders and lines are never deleted.
 
 All routes are under `/v1/organizations/:orgId/purchase-orders`.
 
@@ -310,6 +308,12 @@ All routes are under `/v1/organizations/:orgId/purchase-orders`.
 | `GET /:id` | viewer | Order with its lines (SKU code, name and unit included); `404` for unknown, malformed or other-tenant ids |
 | `POST /` | buyer | Creates a draft: `supplierId`, `warehouseId`, optional `expectedOn` (`YYYY-MM-DD`) and `notes`, `lines` (1–200 of `{ skuId, quantity, unitCostCents? }`); `201` |
 | `PUT /:id/lines` | buyer | `{ lines }` replaces every line of a draft; `409 purchase_order_not_editable` once the order left draft |
+| `POST /:id/submit` | buyer | `draft` → `submitted`; optional `{ reason }` |
+| `POST /:id/approve` | manager | `submitted` → `approved`; optional `{ reason }` |
+| `POST /:id/reject` | manager | `submitted` → `rejected`; `{ reason }` required |
+| `POST /:id/cancel` | buyer | `draft` or `submitted` → `cancelled`; `approved` → `cancelled` needs a manager; `{ reason }` required |
+| `POST /:id/reopen` | buyer | `rejected` → `draft`, so the lines can be fixed and the order submitted again |
+| `GET /:id/events` | viewer | The order's audit trail, oldest first |
 
 ```json
 {
@@ -326,6 +330,45 @@ All routes are under `/v1/organizations/:orgId/purchase-orders`.
 Invalid fields are reported with their line, e.g. `lines[1].quantity`. A SKU
 listed twice, or a supplier, warehouse or SKU that is archived or belongs to
 another organization, returns `422`.
+
+### Approval workflow
+
+Migration `0009_purchase_order_approvals` adds the approval columns and the
+audit trail.
+
+```
+draft ──submit──▶ submitted ──approve──▶ approved ──(receipts)──▶ partially_received ──▶ received
+  │                 │   └──reject──▶ rejected ──reopen──▶ draft
+  └──cancel──▶ cancelled ◀──cancel── submitted / approved
+```
+
+- The rules live in `src/purchasing/purchasing.state-machine.ts`. A step that
+  doesn't apply to the current status gets `409 invalid_status_transition`; a
+  role that is too low gets `403 forbidden`.
+- Four-eyes rule: whoever submitted an order can't approve or reject it, even
+  as an owner (`403 self_decision_not_allowed`). They can still cancel it.
+- The order row is locked while a step runs, so two managers deciding at the
+  same time are serialized: one wins, the other gets `409`.
+- Orders show `submittedBy`/`submittedAt`, `decidedBy`/`decidedAt` and
+  `decisionReason`. Reopening clears them; the history stays in the audit trail.
+- The database backs this up: a trigger refuses any status change that isn't
+  an edge of the diagram (including the receiving edges used later), and a
+  check constraint refuses a decision by the submitter.
+
+Every change to an order (created, lines replaced, each status step) appends
+a row to `audit_events` in the same transaction: action (e.g.
+`purchase_order.approved`), actor, from/to status, reason and the order
+number, line count and total. The table is tenant-scoped and append-only
+(`UPDATE`, `DELETE` and `TRUNCATE` are refused by triggers).
+
+```json
+{
+  "data": [
+    { "action": "purchase_order.submitted", "actorId": "…", "fromStatus": "draft", "toStatus": "submitted", "reason": null, "details": { "number": "PO-000001", "lineCount": 2, "totalCents": 39400 }, "occurredAt": "…" },
+    { "action": "purchase_order.approved", "actorId": "…", "fromStatus": "submitted", "toStatus": "approved", "reason": "Covers the December demand spike", "details": { "number": "PO-000001", "lineCount": 2, "totalCents": 39400 }, "occurredAt": "…" }
+  ]
+}
+```
 
 ## Errors
 
@@ -345,9 +388,9 @@ Every error response has the same shape:
 | Status | `code` |
 |---|---|
 | 401 | `unauthorized` |
-| 403 | `forbidden` |
+| 403 | `forbidden`, `self_decision_not_allowed` |
 | 404 | `not_found` |
-| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied`, `purchase_order_not_editable` |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied`, `purchase_order_not_editable`, `invalid_status_transition` |
 | 422 | `validation_failed` (with `details`), `nothing_to_apply` |
 | 500 | `internal_error` |
 
@@ -378,6 +421,13 @@ same `Idempotency-Key` (one event, the rest replayed), key conflicts and
 per-organization keys, the negative-stock rule for issues, adjustments and
 corrections, concurrent issues racing for the same stock, and the
 append-only ledger with an empty `stock_balance_drift` view.
+
+`purchase-order-approvals.db.spec.ts` covers the approval flow end to end,
+the reopen/resubmit cycle, two managers deciding at once, the status-transition
+trigger, the four-eyes constraint and the append-only audit trail.
+
+`test:db` runs the specs one at a time (`--runInBand`), since each migrates
+its own schema from scratch.
 
 ## Migrations
 

@@ -1,20 +1,44 @@
-import { Body, Controller, Get, HttpStatus, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Post,
+  Put,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
 import { Auth, type AuthContext } from '../auth/auth.context';
 import { RequireRole } from '../auth/require-role.decorator';
+import type { Role } from '../auth/roles';
 import { TenantGuard } from '../auth/tenant.guard';
 import { UnknownReferenceError } from '../catalog/catalog.repository';
 import { isUuid } from '../catalog/catalog.validation';
 import { ApiError, ValidationError } from '../http/api-error';
-import type { PurchaseOrder, PurchaseOrderQuery, PurchaseOrderSummary } from './purchasing.models';
+import type {
+  AuditEvent,
+  PurchaseOrder,
+  PurchaseOrderQuery,
+  PurchaseOrderSummary,
+} from './purchasing.models';
 import {
   LineTotalTooLargeError,
   PurchaseOrderNotEditableError,
   PurchasingRepository,
 } from './purchasing.repository';
 import {
+  InvalidTransitionError,
+  SelfDecisionError,
+  TransitionForbiddenError,
+  type PurchaseOrderAction,
+} from './purchasing.state-machine';
+import {
   parseLineReplacement,
   parseNewPurchaseOrder,
   parsePurchaseOrderQuery,
+  parseTransition,
 } from './purchasing.validation';
 
 function notFound(): ApiError {
@@ -41,13 +65,23 @@ async function write<T>(work: () => Promise<T>): Promise<T> {
     if (error instanceof PurchaseOrderNotEditableError) {
       throw new ApiError(HttpStatus.CONFLICT, 'purchase_order_not_editable', error.message);
     }
+    if (error instanceof InvalidTransitionError) {
+      throw new ApiError(HttpStatus.CONFLICT, 'invalid_status_transition', error.message);
+    }
+    if (error instanceof TransitionForbiddenError) {
+      throw new ApiError(HttpStatus.FORBIDDEN, 'forbidden', error.message);
+    }
+    if (error instanceof SelfDecisionError) {
+      throw new ApiError(HttpStatus.FORBIDDEN, 'self_decision_not_allowed', error.message);
+    }
     throw error;
   }
 }
 
 /**
  * Purchase orders, scoped to the organization in the path. Any member can
- * read; buyers and above create drafts and edit their lines.
+ * read; buyers and above create drafts, edit their lines, submit, cancel and
+ * reopen; managers and above approve or reject (and cancel approved orders).
  */
 @Controller('v1/organizations/:orgId/purchase-orders')
 @UseGuards(TenantGuard)
@@ -95,7 +129,80 @@ export class PurchasingController {
   ): Promise<{ data: PurchaseOrder }> {
     if (!isUuid(id)) throw notFound();
     const lines = parseLineReplacement(body);
-    const order = await write(() => this.purchasing.replaceLines(orgOf(auth), id, lines));
+    const order = await write(() =>
+      this.purchasing.replaceLines(orgOf(auth), id, lines, auth.userId),
+    );
+    if (!order) throw notFound();
+    return { data: order };
+  }
+
+  /** Audit trail of the order, oldest first. */
+  @Get(':id/events')
+  @RequireRole('viewer')
+  async events(
+    @Auth() auth: AuthContext,
+    @Param('id') id: string,
+  ): Promise<{ data: AuditEvent[] }> {
+    const events = isUuid(id) ? await this.purchasing.listEvents(orgOf(auth), id) : null;
+    if (!events) throw notFound();
+    return { data: events };
+  }
+
+  /** draft → submitted, for a manager (other than the submitter) to decide on. */
+  @Post(':id/submit')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole('buyer')
+  submit(@Auth() auth: AuthContext, @Param('id') id: string, @Body() body: unknown) {
+    return this.transition('submit', auth, id, body);
+  }
+
+  @Post(':id/approve')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole('manager')
+  approve(@Auth() auth: AuthContext, @Param('id') id: string, @Body() body: unknown) {
+    return this.transition('approve', auth, id, body);
+  }
+
+  /** Needs a `reason`. */
+  @Post(':id/reject')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole('manager')
+  reject(@Auth() auth: AuthContext, @Param('id') id: string, @Body() body: unknown) {
+    return this.transition('reject', auth, id, body);
+  }
+
+  /** Needs a `reason`; cancelling an approved order needs a manager. */
+  @Post(':id/cancel')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole('buyer')
+  cancel(@Auth() auth: AuthContext, @Param('id') id: string, @Body() body: unknown) {
+    return this.transition('cancel', auth, id, body);
+  }
+
+  /** rejected → draft, so the buyer can fix the lines and submit again. */
+  @Post(':id/reopen')
+  @HttpCode(HttpStatus.OK)
+  @RequireRole('buyer')
+  reopen(@Auth() auth: AuthContext, @Param('id') id: string, @Body() body: unknown) {
+    return this.transition('reopen', auth, id, body);
+  }
+
+  private async transition(
+    action: PurchaseOrderAction,
+    auth: AuthContext,
+    id: string,
+    body: unknown,
+  ): Promise<{ data: PurchaseOrder }> {
+    if (!isUuid(id)) throw notFound();
+    const { reason } = parseTransition(action, body);
+    const order = await write(() =>
+      this.purchasing.transition(orgOf(auth), id, {
+        action,
+        actorId: auth.userId,
+        actorRole: auth.role as Role,
+        reason,
+      }),
+    );
     if (!order) throw notFound();
     return { data: order };
   }
