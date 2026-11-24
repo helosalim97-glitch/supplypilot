@@ -134,6 +134,14 @@ are serialized by the balance row lock, so two issues cannot both spend the
 same stock. The rule checks the current total; a back-dated `occurredAt` is
 not replayed against older balances.
 
+Migration `0010_balance_trigger_drawdown` replaces the trigger function from
+0005. The original upsert proposed the movement's own delta as a new row, and
+PostgreSQL checks `CHECK` constraints before it detects the conflict, so every
+issue and negative adjustment was refused even with stock on hand. The trigger
+now updates an existing balance first and only inserts the first balance for
+a SKU and warehouse (retrying the update if another transaction created it at
+the same moment).
+
 ### `GET /v1/organizations/:orgId/inventory`
 
 Any member (`viewer` and up). Lists balances with SKU and warehouse details,
