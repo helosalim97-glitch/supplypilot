@@ -117,6 +117,8 @@ function fakePurchasing(catalogs: ReturnType<typeof catalogFor>[]) {
         skuName: sku.name,
         unit: sku.unit,
         quantityOrdered: line.quantity,
+        quantityReceived: 0,
+        quantityOutstanding: line.quantity,
         unitCostCents,
         lineTotalCents: line.quantity * unitCostCents,
       };
@@ -182,6 +184,7 @@ function fakePurchasing(catalogs: ReturnType<typeof catalogFor>[]) {
         decisionReason: null,
         lineCount: 0,
         totalUnits: 0,
+        totalUnitsReceived: 0,
         totalCents: 0,
         createdAt: now,
         updatedAt: now,

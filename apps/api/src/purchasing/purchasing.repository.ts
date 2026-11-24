@@ -4,25 +4,37 @@ import type { Role } from '../auth/roles';
 import { UnknownReferenceError } from '../catalog/catalog.repository';
 import { PG_POOL } from '../database/database.module';
 import {
+  IdempotencyConflictError,
+  StockOverflowError,
+  movementHash,
+} from '../inventory/inventory.repository';
+import {
   toAuditEvent,
+  toReceipt,
   toPurchaseOrderLine,
   toPurchaseOrderSummary,
   type AuditEvent,
   type AuditEventRow,
   type NewPurchaseOrder,
   type NewPurchaseOrderLine,
+  type NewReceipt,
   type PurchaseOrder,
   type PurchaseOrderLineRow,
   type PurchaseOrderQuery,
   type PurchaseOrderRow,
   type PurchaseOrderStatus,
   type PurchaseOrderSummary,
+  type Receipt,
+  type ReceiptLineRow,
+  type ReceiptRow,
+  type RecordedReceipt,
 } from './purchasing.models';
 import {
   AUDIT_ACTION,
   planTransition,
   type PurchaseOrderAction,
 } from './purchasing.state-machine';
+import { planReceipt, receiptEventKey, receiptHash, type ReceivableLine } from './receiving';
 
 /** The order exists but is no longer a draft, so its lines are frozen. */
 export class PurchaseOrderNotEditableError extends Error {
@@ -41,6 +53,9 @@ export class LineTotalTooLargeError extends Error {
 }
 
 const CHECK_VIOLATION = '23514';
+const UNIQUE_VIOLATION = '23505';
+const NUMERIC_VALUE_OUT_OF_RANGE = '22003';
+const RECEIPT_KEY_CONSTRAINT = 'purchase_order_receipts_organization_id_idempotency_key_key';
 const LINE_TOTAL_CONSTRAINT = 'purchase_order_lines_total_cap';
 
 function pgError(error: unknown): { code?: string; constraint?: string } {
@@ -55,18 +70,24 @@ const ORDER_SELECT = `SELECT po.id, po.organization_id, po.number, po.status,
        po.warehouse_id, w.code AS warehouse_code, w.name AS warehouse_name,
        po.expected_on::text AS expected_on, po.notes, po.created_by,
        po.submitted_by, po.submitted_at, po.decided_by, po.decided_at, po.decision_reason,
-       t.line_count, t.total_units, t.total_cents, po.created_at, po.updated_at
+       t.line_count, t.total_units, t.total_units_received, t.total_cents,
+       po.created_at, po.updated_at
   FROM purchase_orders po
   JOIN suppliers s ON s.organization_id = po.organization_id AND s.id = po.supplier_id
   JOIN warehouses w ON w.organization_id = po.organization_id AND w.id = po.warehouse_id
   CROSS JOIN LATERAL (
     SELECT count(*)::int AS line_count,
            coalesce(sum(l.quantity_ordered), 0)::bigint AS total_units,
+           coalesce(sum(l.quantity_received), 0)::bigint AS total_units_received,
            coalesce(sum(l.line_total_cents), 0)::bigint AS total_cents
       FROM purchase_order_lines l
      WHERE l.organization_id = po.organization_id AND l.purchase_order_id = po.id
   ) t
  WHERE po.organization_id = $1`;
+
+const RECEIPT_SELECT = `SELECT r.id, r.purchase_order_id, r.reference, r.notes, r.received_by,
+       r.received_at, r.recorded_at, r.request_hash
+  FROM purchase_order_receipts r`;
 
 /**
  * Columns each action sets besides `status` ($1 org, $2 order, $3 status are
@@ -310,6 +331,218 @@ export class PurchasingRepository {
     });
   }
 
+  /**
+   * Books one delivery against an approved order, in one transaction:
+   * the receipt and its lines, one `receipt` event per line in the inventory
+   * ledger (so stock goes up), the lines' received totals, the order's next
+   * status and an audit event. The order row is locked first, so concurrent
+   * deliveries for the same order run one after the other and can never
+   * receive more than was ordered between them.
+   *
+   * The Idempotency-Key is checked before anything else: a retry of a booked
+   * delivery returns it unchanged (`replayed`), even if the order has since
+   * been received in full. Returns null for an unknown order.
+   */
+  async receive(
+    organizationId: string,
+    orderId: string,
+    actorId: string,
+    idempotencyKey: string,
+    input: NewReceipt,
+  ): Promise<RecordedReceipt | null> {
+    const hash = receiptHash(orderId, input);
+    try {
+      return await this.transaction(async (client) => {
+        const current = await client.query<{
+          status: PurchaseOrderStatus;
+          number: string;
+          warehouse_id: string;
+        }>(
+          `SELECT status, number, warehouse_id FROM purchase_orders
+            WHERE organization_id = $1 AND id = $2 FOR UPDATE`,
+          [organizationId, orderId],
+        );
+        const order = current.rows[0];
+        if (!order) return null;
+
+        const previous = await client.query<ReceiptRow>(
+          `${RECEIPT_SELECT} WHERE r.organization_id = $1 AND r.idempotency_key = $2`,
+          [organizationId, idempotencyKey],
+        );
+        if (previous.rows[0]) {
+          if (previous.rows[0].request_hash !== hash) {
+            throw new IdempotencyConflictError(idempotencyKey);
+          }
+          const [receipt] = await this.readReceipts(client, organizationId, previous.rows);
+          const unchanged = (await this.readOrder(client, organizationId, orderId)) as PurchaseOrder;
+          return { receipt, order: unchanged, replayed: true };
+        }
+
+        const lines = await client.query<{
+          id: string;
+          line_number: number;
+          sku_id: string;
+          quantity_ordered: number;
+          quantity_received: number;
+        }>(
+          `SELECT id, line_number, sku_id, quantity_ordered, quantity_received
+             FROM purchase_order_lines
+            WHERE organization_id = $1 AND purchase_order_id = $2
+            ORDER BY line_number`,
+          [organizationId, orderId],
+        );
+        const plan = planReceipt(
+          order.status,
+          lines.rows.map(
+            (l): ReceivableLine => ({
+              id: l.id,
+              lineNumber: l.line_number,
+              skuId: l.sku_id,
+              quantityOrdered: l.quantity_ordered,
+              quantityReceived: l.quantity_received,
+            }),
+          ),
+          input.lines,
+        );
+
+        const inserted = await client.query<{ id: string; received_at: Date }>(
+          `INSERT INTO purchase_order_receipts
+             (organization_id, purchase_order_id, reference, notes, idempotency_key,
+              request_hash, received_by, received_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, coalesce($8::timestamptz, now()))
+           RETURNING id, received_at`,
+          [
+            organizationId,
+            orderId,
+            input.reference,
+            input.notes,
+            idempotencyKey,
+            hash,
+            actorId,
+            input.receivedAt,
+          ],
+        );
+        const receiptId = inserted.rows[0].id;
+        const occurredAt = inserted.rows[0].received_at.toISOString();
+
+        for (const { line, quantity } of plan.lines) {
+          const movement = {
+            skuId: line.skuId,
+            warehouseId: order.warehouse_id,
+            type: 'receipt' as const,
+            quantityDelta: quantity,
+            reason: null,
+            reference: order.number,
+            correctsEventId: null,
+            occurredAt,
+          };
+          const event = await client.query<{ id: string }>(
+            `INSERT INTO inventory_events
+               (organization_id, sku_id, warehouse_id, event_type, quantity_delta, reference,
+                idempotency_key, request_hash, created_by, occurred_at)
+             VALUES ($1, $2, $3, 'receipt', $4, $5, $6, $7, $8, $9)
+             RETURNING id`,
+            [
+              organizationId,
+              line.skuId,
+              order.warehouse_id,
+              quantity,
+              order.number,
+              receiptEventKey(receiptId, line.lineNumber),
+              movementHash(movement),
+              actorId,
+              occurredAt,
+            ],
+          );
+          await client.query(
+            `INSERT INTO purchase_order_receipt_lines
+               (organization_id, receipt_id, purchase_order_line_id, quantity, inventory_event_id)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [organizationId, receiptId, line.id, quantity, event.rows[0].id],
+          );
+          await client.query(
+            `UPDATE purchase_order_lines SET quantity_received = quantity_received + $3
+              WHERE organization_id = $1 AND id = $2`,
+            [organizationId, line.id, quantity],
+          );
+        }
+
+        const statusChanged = plan.nextStatus !== order.status;
+        await client.query(
+          `UPDATE purchase_orders SET status = $3, updated_at = now()
+            WHERE organization_id = $1 AND id = $2`,
+          [organizationId, orderId, plan.nextStatus],
+        );
+
+        const updated = (await this.readOrder(client, organizationId, orderId)) as PurchaseOrder;
+        await this.audit(client, organizationId, updated, {
+          action: 'purchase_order.goods_received',
+          actorId,
+          fromStatus: statusChanged ? order.status : null,
+          toStatus: statusChanged ? plan.nextStatus : null,
+          reason: null,
+          details: {
+            receiptId,
+            unitsReceived: plan.units,
+            receiptLineCount: plan.lines.length,
+            totalUnitsReceived: updated.totalUnitsReceived,
+          },
+        });
+
+        const created = await client.query<ReceiptRow>(
+          `${RECEIPT_SELECT} WHERE r.organization_id = $1 AND r.id = $2`,
+          [organizationId, receiptId],
+        );
+        const [receipt] = await this.readReceipts(client, organizationId, created.rows);
+        return { receipt, order: updated, replayed: false };
+      });
+    } catch (error) {
+      const { code, constraint } = pgError(error);
+      // The same key used at the same moment for another order's delivery.
+      if (code === UNIQUE_VIOLATION && constraint === RECEIPT_KEY_CONSTRAINT) {
+        throw new IdempotencyConflictError(idempotencyKey);
+      }
+      if (code === NUMERIC_VALUE_OUT_OF_RANGE) throw new StockOverflowError();
+      throw error;
+    }
+  }
+
+  /** The order's receipts, oldest first; null for an unknown order. */
+  async listReceipts(organizationId: string, orderId: string): Promise<Receipt[] | null> {
+    const exists = await this.pool.query(
+      'SELECT 1 FROM purchase_orders WHERE organization_id = $1 AND id = $2',
+      [organizationId, orderId],
+    );
+    if (!exists.rows[0]) return null;
+    const { rows } = await this.pool.query<ReceiptRow>(
+      `${RECEIPT_SELECT} WHERE r.organization_id = $1 AND r.purchase_order_id = $2
+        ORDER BY r.recorded_at, r.id`,
+      [organizationId, orderId],
+    );
+    return this.readReceipts(this.pool, organizationId, rows);
+  }
+
+  /** The receipts' lines (with line number and SKU code), attached in order. */
+  private async readReceipts(
+    db: Queryable,
+    organizationId: string,
+    receipts: ReceiptRow[],
+  ): Promise<Receipt[]> {
+    if (receipts.length === 0) return [];
+    const { rows } = await db.query<ReceiptLineRow>(
+      `SELECT rl.receipt_id, rl.purchase_order_line_id, l.line_number, l.sku_id,
+              k.code AS sku_code, rl.quantity, rl.inventory_event_id
+         FROM purchase_order_receipt_lines rl
+         JOIN purchase_order_lines l
+           ON l.organization_id = rl.organization_id AND l.id = rl.purchase_order_line_id
+         JOIN skus k ON k.organization_id = l.organization_id AND k.id = l.sku_id
+        WHERE rl.organization_id = $1 AND rl.receipt_id = ANY($2::uuid[])
+        ORDER BY l.line_number`,
+      [organizationId, receipts.map((r) => r.id)],
+    );
+    return receipts.map((r) => toReceipt(r, rows));
+  }
+
   /** The order's audit trail, oldest first; null for an unknown order. */
   async listEvents(organizationId: string, orderId: string): Promise<AuditEvent[] | null> {
     const exists = await this.pool.query(
@@ -339,6 +572,7 @@ export class PurchasingRepository {
       fromStatus: PurchaseOrderStatus | null;
       toStatus: PurchaseOrderStatus | null;
       reason: string | null;
+      details?: Record<string, unknown>;
     },
   ): Promise<void> {
     await client.query(
@@ -358,6 +592,7 @@ export class PurchasingRepository {
           number: order.number,
           lineCount: order.lineCount,
           totalCents: order.totalCents,
+          ...event.details,
         }),
       ],
     );
@@ -430,7 +665,7 @@ export class PurchasingRepository {
     if (!header.rows[0]) return null;
     const lines = await db.query<PurchaseOrderLineRow>(
       `SELECT l.id, l.line_number, l.sku_id, k.code AS sku_code, k.name AS sku_name, k.unit,
-              l.quantity_ordered, l.unit_cost_cents, l.line_total_cents
+              l.quantity_ordered, l.quantity_received, l.unit_cost_cents, l.line_total_cents
          FROM purchase_order_lines l
          JOIN skus k ON k.organization_id = l.organization_id AND k.id = l.sku_id
         WHERE l.organization_id = $1 AND l.purchase_order_id = $2

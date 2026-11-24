@@ -1,10 +1,12 @@
 import { isUuid } from '../catalog/catalog.validation';
 import { ValidationError, type FieldError } from '../http/api-error';
-import { optionalText } from '../inventory/inventory.validation';
+import { optionalText, parseOccurredAt } from '../inventory/inventory.validation';
 import {
   PURCHASE_ORDER_STATUSES,
   type NewPurchaseOrder,
   type NewPurchaseOrderLine,
+  type NewReceipt,
+  type NewReceiptLine,
   type PurchaseOrderQuery,
   type PurchaseOrderStatus,
 } from './purchasing.models';
@@ -245,4 +247,63 @@ export function parsePurchaseOrderQuery(query: unknown): PurchaseOrderQuery {
   };
   if (errors.length > 0) throw new ValidationError(errors);
   return result;
+}
+
+const RECEIPT_FIELDS = ['lines', 'reference', 'notes', 'receivedAt'];
+const RECEIPT_LINE_FIELDS = ['lineId', 'quantity'];
+
+function parseReceiptLine(value: unknown, index: number, errors: FieldError[]): NewReceiptLine {
+  const prefix = `lines[${index}].`;
+  if (!isObject(value)) {
+    errors.push({ field: `lines[${index}]`, message: 'must be an object' });
+    return { lineId: '', quantity: 0 };
+  }
+  rejectUnknown(value, RECEIPT_LINE_FIELDS, prefix, errors);
+  const lineId = uuid(value.lineId, `${prefix}lineId`, errors);
+  const q = value.quantity;
+  if (typeof q === 'number' && Number.isInteger(q) && q >= 1 && q <= MAX_LINE_QUANTITY) {
+    return { lineId, quantity: q };
+  }
+  errors.push({
+    field: `${prefix}quantity`,
+    message: `must be a whole number from 1 to ${MAX_LINE_QUANTITY}`,
+  });
+  return { lineId, quantity: 0 };
+}
+
+/**
+ * Body of `POST .../purchase-orders/:id/receipts`: 1–200 lines of
+ * `{ lineId, quantity }`, each order line at most once, plus an optional
+ * delivery `reference`, `notes` and `receivedAt` (not in the future).
+ * Whether the quantities fit what is still outstanding is checked against
+ * the order itself (see receiving.ts).
+ */
+export function parseNewReceipt(body: unknown, now: Date = new Date()): NewReceipt {
+  const input = objectBody(body);
+  const errors: FieldError[] = [];
+  rejectUnknown(input, RECEIPT_FIELDS, '', errors);
+
+  let lines: NewReceiptLine[] = [];
+  if (!Array.isArray(input.lines) || input.lines.length < 1 || input.lines.length > MAX_LINES) {
+    errors.push({ field: 'lines', message: `must be an array of 1 to ${MAX_LINES} lines` });
+  } else {
+    lines = input.lines.map((line, index) => parseReceiptLine(line, index, errors));
+    const seen = new Set<string>();
+    lines.forEach((line, index) => {
+      if (!line.lineId) return;
+      if (seen.has(line.lineId)) {
+        errors.push({ field: `lines[${index}].lineId`, message: 'appears on an earlier line' });
+      }
+      seen.add(line.lineId);
+    });
+  }
+
+  const receipt: NewReceipt = {
+    lines,
+    reference: optionalText(input, 'reference', 120, errors),
+    notes: optionalText(input, 'notes', 1000, errors),
+    receivedAt: parseOccurredAt(input.receivedAt, now, errors, 'receivedAt'),
+  };
+  if (errors.length > 0) throw new ValidationError(errors);
+  return receipt;
 }

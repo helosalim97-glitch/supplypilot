@@ -105,6 +105,7 @@ function fakePurchasing() {
         decisionReason: null,
         lineCount: 1,
         totalUnits: 400,
+        totalUnitsReceived: 0,
         totalCents: 34_000,
         createdAt: now,
         updatedAt: now,

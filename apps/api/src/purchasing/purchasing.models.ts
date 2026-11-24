@@ -20,6 +20,9 @@ export interface PurchaseOrderLine {
   skuName: string;
   unit: string;
   quantityOrdered: number;
+  /** Units booked in by receipts so far (never more than ordered). */
+  quantityReceived: number;
+  quantityOutstanding: number;
   unitCostCents: number;
   lineTotalCents: number;
 }
@@ -49,6 +52,7 @@ export interface PurchaseOrderSummary {
   decisionReason: string | null;
   lineCount: number;
   totalUnits: number;
+  totalUnitsReceived: number;
   totalCents: number;
   createdAt: string;
   updatedAt: string;
@@ -103,6 +107,7 @@ export interface PurchaseOrderRow {
   decision_reason: string | null;
   line_count: number;
   total_units: string | number;
+  total_units_received: string | number;
   total_cents: string | number;
   created_at: Date;
   updated_at: Date;
@@ -116,6 +121,7 @@ export interface PurchaseOrderLineRow {
   sku_name: string;
   unit: string;
   quantity_ordered: number;
+  quantity_received: number;
   unit_cost_cents: number;
   line_total_cents: string | number;
 }
@@ -142,6 +148,7 @@ export function toPurchaseOrderSummary(row: PurchaseOrderRow): PurchaseOrderSumm
     decisionReason: row.decision_reason,
     lineCount: row.line_count,
     totalUnits: Number(row.total_units),
+    totalUnitsReceived: Number(row.total_units_received),
     totalCents: Number(row.total_cents),
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
@@ -157,6 +164,8 @@ export function toPurchaseOrderLine(row: PurchaseOrderLineRow): PurchaseOrderLin
     skuName: row.sku_name,
     unit: row.unit,
     quantityOrdered: row.quantity_ordered,
+    quantityReceived: row.quantity_received,
+    quantityOutstanding: row.quantity_ordered - row.quantity_received,
     unitCostCents: row.unit_cost_cents,
     lineTotalCents: Number(row.line_total_cents),
   };
@@ -202,5 +211,92 @@ export function toAuditEvent(row: AuditEventRow): AuditEvent {
     reason: row.reason,
     details: row.details,
     occurredAt: row.occurred_at.toISOString(),
+  };
+}
+
+/** One line of a delivery: how many units arrived for one order line. */
+export interface NewReceiptLine {
+  lineId: string;
+  quantity: number;
+}
+
+/** Body of `POST .../purchase-orders/:id/receipts`. */
+export interface NewReceipt {
+  lines: NewReceiptLine[];
+  /** Supplier's delivery note or packing slip number. */
+  reference: string | null;
+  notes: string | null;
+  /** When the goods arrived (ISO 8601); `null` = now. */
+  receivedAt: string | null;
+}
+
+export interface ReceiptLine {
+  purchaseOrderLineId: string;
+  lineNumber: number;
+  skuId: string;
+  skuCode: string;
+  quantity: number;
+  /** The `receipt` event this line wrote to the inventory ledger. */
+  inventoryEventId: string;
+}
+
+export interface Receipt {
+  id: string;
+  purchaseOrderId: string;
+  reference: string | null;
+  notes: string | null;
+  receivedBy: string;
+  receivedAt: string;
+  recordedAt: string;
+  lines: ReceiptLine[];
+}
+
+export interface RecordedReceipt {
+  receipt: Receipt;
+  order: PurchaseOrder;
+  /** True when the Idempotency-Key was seen before and nothing new was booked. */
+  replayed: boolean;
+}
+
+export interface ReceiptRow {
+  id: string;
+  purchase_order_id: string;
+  reference: string | null;
+  notes: string | null;
+  received_by: string;
+  received_at: Date;
+  recorded_at: Date;
+  request_hash: string;
+}
+
+export interface ReceiptLineRow {
+  receipt_id: string;
+  purchase_order_line_id: string;
+  line_number: number;
+  sku_id: string;
+  sku_code: string;
+  quantity: number;
+  inventory_event_id: string;
+}
+
+export function toReceipt(row: ReceiptRow, lines: ReceiptLineRow[]): Receipt {
+  return {
+    id: row.id,
+    purchaseOrderId: row.purchase_order_id,
+    reference: row.reference,
+    notes: row.notes,
+    receivedBy: row.received_by,
+    receivedAt: row.received_at.toISOString(),
+    recordedAt: row.recorded_at.toISOString(),
+    lines: lines
+      .filter((l) => l.receipt_id === row.id)
+      .map((l) => ({
+        purchaseOrderLineId: l.purchase_order_line_id,
+        lineNumber: l.line_number,
+        skuId: l.sku_id,
+        skuCode: l.sku_code,
+        quantity: l.quantity,
+        inventoryEventId: l.inventory_event_id,
+      })),
   };
 }

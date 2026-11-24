@@ -2,14 +2,17 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
   HttpCode,
   HttpStatus,
   Param,
   Post,
   Put,
   Query,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { Auth, type AuthContext } from '../auth/auth.context';
 import { RequireRole } from '../auth/require-role.decorator';
 import type { Role } from '../auth/roles';
@@ -17,11 +20,14 @@ import { TenantGuard } from '../auth/tenant.guard';
 import { UnknownReferenceError } from '../catalog/catalog.repository';
 import { isUuid } from '../catalog/catalog.validation';
 import { ApiError, ValidationError } from '../http/api-error';
+import { IdempotencyConflictError, StockOverflowError } from '../inventory/inventory.repository';
+import { parseIdempotencyKey } from '../inventory/inventory.validation';
 import type {
   AuditEvent,
   PurchaseOrder,
   PurchaseOrderQuery,
   PurchaseOrderSummary,
+  Receipt,
 } from './purchasing.models';
 import {
   LineTotalTooLargeError,
@@ -37,9 +43,15 @@ import {
 import {
   parseLineReplacement,
   parseNewPurchaseOrder,
+  parseNewReceipt,
   parsePurchaseOrderQuery,
   parseTransition,
 } from './purchasing.validation';
+import {
+  OverReceiptError,
+  PurchaseOrderNotReceivableError,
+  UnknownOrderLineError,
+} from './receiving';
 
 function notFound(): ApiError {
   return new ApiError(HttpStatus.NOT_FOUND, 'not_found', 'Purchase order not found');
@@ -74,14 +86,39 @@ async function write<T>(work: () => Promise<T>): Promise<T> {
     if (error instanceof SelfDecisionError) {
       throw new ApiError(HttpStatus.FORBIDDEN, 'self_decision_not_allowed', error.message);
     }
+    if (error instanceof PurchaseOrderNotReceivableError) {
+      throw new ApiError(HttpStatus.CONFLICT, 'purchase_order_not_receivable', error.message);
+    }
+    if (error instanceof OverReceiptError) {
+      throw new ApiError(HttpStatus.CONFLICT, 'over_receipt', 'More units than are outstanding', [
+        {
+          field: `lines[${error.index}].quantity`,
+          message: `is more than the ${error.outstanding} unit(s) still outstanding`,
+        },
+      ]);
+    }
+    if (error instanceof UnknownOrderLineError) {
+      throw new ValidationError([
+        { field: `lines[${error.index}].lineId`, message: 'is not a line of this purchase order' },
+      ]);
+    }
+    if (error instanceof IdempotencyConflictError) {
+      throw new ApiError(HttpStatus.CONFLICT, 'idempotency_conflict', error.message, [
+        { field: 'Idempotency-Key', message: 'was already used for a different delivery' },
+      ]);
+    }
+    if (error instanceof StockOverflowError) {
+      throw new ValidationError([{ field: 'lines', message: error.message }]);
+    }
     throw error;
   }
 }
 
 /**
  * Purchase orders, scoped to the organization in the path. Any member can
- * read; buyers and above create drafts, edit their lines, submit, cancel and
- * reopen; managers and above approve or reject (and cancel approved orders).
+ * read; buyers and above create drafts, edit their lines, submit, cancel,
+ * reopen and receive deliveries; managers and above approve or reject (and
+ * cancel approved orders).
  */
 @Controller('v1/organizations/:orgId/purchase-orders')
 @UseGuards(TenantGuard)
@@ -146,6 +183,44 @@ export class PurchasingController {
     const events = isUuid(id) ? await this.purchasing.listEvents(orgOf(auth), id) : null;
     if (!events) throw notFound();
     return { data: events };
+  }
+
+  /**
+   * Books a delivery (possibly partial) against an approved order and adds
+   * the units to stock. `Idempotency-Key` is required: `201` for a new
+   * receipt, `200` with `Idempotent-Replayed: true` for a retry.
+   */
+  @Post(':id/receipts')
+  @RequireRole('buyer')
+  async receive(
+    @Auth() auth: AuthContext,
+    @Param('id') id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() body: unknown,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<{ data: { receipt: Receipt; order: PurchaseOrder } }> {
+    if (!isUuid(id)) throw notFound();
+    const key = parseIdempotencyKey(idempotencyKey);
+    const input = parseNewReceipt(body);
+    const result = await write(() =>
+      this.purchasing.receive(orgOf(auth), id, auth.userId, key, input),
+    );
+    if (!result) throw notFound();
+    res.status(result.replayed ? HttpStatus.OK : HttpStatus.CREATED);
+    res.setHeader('Idempotent-Replayed', String(result.replayed));
+    return { data: { receipt: result.receipt, order: result.order } };
+  }
+
+  /** Deliveries booked against the order, oldest first. */
+  @Get(':id/receipts')
+  @RequireRole('viewer')
+  async receipts(
+    @Auth() auth: AuthContext,
+    @Param('id') id: string,
+  ): Promise<{ data: Receipt[] }> {
+    const receipts = isUuid(id) ? await this.purchasing.listReceipts(orgOf(auth), id) : null;
+    if (!receipts) throw notFound();
+    return { data: receipts };
   }
 
   /** draft → submitted, for a manager (other than the submitter) to decide on. */
