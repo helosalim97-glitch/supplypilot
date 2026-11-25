@@ -121,4 +121,6 @@ cp .env.example .env
 pnpm services:up        # PostgreSQL and Redis via Docker Compose
 pnpm fixtures           # generate synthetic data into .fixtures/ (needs Python 3.11+)
 pnpm test:fixtures      # run the fixture generator's tests
+pnpm api:dev            # API on :3001 (see apps/api/README.md)
+pnpm web:dev            # web app on :3000 (see apps/web/README.md)
 ```

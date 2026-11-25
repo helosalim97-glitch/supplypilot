@@ -1,0 +1,26 @@
+{
+  "name": "@supplypilot/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SupplyPilot web app (Next.js)",
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "next": "15.5.29",
+    "react": "19.1.10",
+    "react-dom": "19.1.10",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.10",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "typescript": "^5.6.2",
+    "vitest": "^3.2.4"
+  }
+}

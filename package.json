@@ -13,6 +13,7 @@
     "services:up": "docker compose -f infra/compose/docker-compose.yml --env-file .env up -d --wait",
     "services:down": "docker compose -f infra/compose/docker-compose.yml --env-file .env down",
     "api:dev": "pnpm --filter @supplypilot/api dev",
+    "web:dev": "pnpm --filter @supplypilot/web dev",
     "db:migrate": "pnpm --filter @supplypilot/api migrate",
     "test:fixtures": "cd packages/fixtures && python3 -m unittest discover -s tests -t .",
     "fixtures": "cd packages/fixtures && python3 -m supplypilot_fixtures --out ../../.fixtures"
