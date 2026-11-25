@@ -106,15 +106,16 @@ export function parseOccurredAt(
   value: unknown,
   now: Date,
   errors: FieldError[],
+  field = 'occurredAt',
 ): string | null {
   if (value === undefined || value === null) return null;
   const time = typeof value === 'string' && TIMESTAMP_PATTERN.test(value) ? Date.parse(value) : NaN;
   if (Number.isNaN(time)) {
-    errors.push({ field: 'occurredAt', message: 'must be an ISO 8601 date-time with a time zone' });
+    errors.push({ field, message: 'must be an ISO 8601 date-time with a time zone' });
     return null;
   }
   if (time > now.getTime() + MAX_FUTURE_MS) {
-    errors.push({ field: 'occurredAt', message: 'must not be in the future' });
+    errors.push({ field, message: 'must not be in the future' });
     return null;
   }
   return new Date(time).toISOString();

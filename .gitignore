@@ -31,3 +31,7 @@ coverage/
 
 # Generated fixture output
 .fixtures/
+
+# Next.js (rewritten by next build)
+next-env.d.ts
+*.tsbuildinfo

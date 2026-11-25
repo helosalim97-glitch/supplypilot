@@ -1,0 +1,302 @@
+/** Purchase orders as the API exposes them (camelCase, ISO timestamps). */
+
+export const PURCHASE_ORDER_STATUSES = [
+  'draft',
+  'submitted',
+  'approved',
+  'rejected',
+  'cancelled',
+  'partially_received',
+  'received',
+] as const;
+
+export type PurchaseOrderStatus = (typeof PURCHASE_ORDER_STATUSES)[number];
+
+export interface PurchaseOrderLine {
+  id: string;
+  lineNumber: number;
+  skuId: string;
+  skuCode: string;
+  skuName: string;
+  unit: string;
+  quantityOrdered: number;
+  /** Units booked in by receipts so far (never more than ordered). */
+  quantityReceived: number;
+  quantityOutstanding: number;
+  unitCostCents: number;
+  lineTotalCents: number;
+}
+
+/** One row of the order list: header plus line totals, without the lines. */
+export interface PurchaseOrderSummary {
+  id: string;
+  organizationId: string;
+  number: string;
+  status: PurchaseOrderStatus;
+  supplierId: string;
+  supplierCode: string;
+  supplierName: string;
+  warehouseId: string;
+  warehouseCode: string;
+  warehouseName: string;
+  /** Calendar date (YYYY-MM-DD) the delivery is expected, if known. */
+  expectedOn: string | null;
+  notes: string | null;
+  createdBy: string;
+  /** Who last submitted the order for approval and when; cleared on reopen. */
+  submittedBy: string | null;
+  submittedAt: string | null;
+  /** Who approved or rejected it, when, and the reason they gave. */
+  decidedBy: string | null;
+  decidedAt: string | null;
+  decisionReason: string | null;
+  lineCount: number;
+  totalUnits: number;
+  totalUnitsReceived: number;
+  totalCents: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PurchaseOrder extends PurchaseOrderSummary {
+  lines: PurchaseOrderLine[];
+}
+
+export interface NewPurchaseOrderLine {
+  skuId: string;
+  quantity: number;
+  /** `null` = use the SKU's current catalog cost. */
+  unitCostCents: number | null;
+}
+
+export interface NewPurchaseOrder {
+  supplierId: string;
+  warehouseId: string;
+  expectedOn: string | null;
+  notes: string | null;
+  lines: NewPurchaseOrderLine[];
+}
+
+export interface PurchaseOrderQuery {
+  status: PurchaseOrderStatus | null;
+  supplierId: string | null;
+  warehouseId: string | null;
+  limit: number;
+  offset: number;
+}
+
+/** Rows as returned by `pg`. Bigint sums arrive as strings. */
+export interface PurchaseOrderRow {
+  id: string;
+  organization_id: string;
+  number: string;
+  status: PurchaseOrderStatus;
+  supplier_id: string;
+  supplier_code: string;
+  supplier_name: string;
+  warehouse_id: string;
+  warehouse_code: string;
+  warehouse_name: string;
+  expected_on: string | null;
+  notes: string | null;
+  created_by: string;
+  submitted_by: string | null;
+  submitted_at: Date | null;
+  decided_by: string | null;
+  decided_at: Date | null;
+  decision_reason: string | null;
+  line_count: number;
+  total_units: string | number;
+  total_units_received: string | number;
+  total_cents: string | number;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface PurchaseOrderLineRow {
+  id: string;
+  line_number: number;
+  sku_id: string;
+  sku_code: string;
+  sku_name: string;
+  unit: string;
+  quantity_ordered: number;
+  quantity_received: number;
+  unit_cost_cents: number;
+  line_total_cents: string | number;
+}
+
+export function toPurchaseOrderSummary(row: PurchaseOrderRow): PurchaseOrderSummary {
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    number: row.number,
+    status: row.status,
+    supplierId: row.supplier_id,
+    supplierCode: row.supplier_code,
+    supplierName: row.supplier_name,
+    warehouseId: row.warehouse_id,
+    warehouseCode: row.warehouse_code,
+    warehouseName: row.warehouse_name,
+    expectedOn: row.expected_on,
+    notes: row.notes,
+    createdBy: row.created_by,
+    submittedBy: row.submitted_by,
+    submittedAt: row.submitted_at?.toISOString() ?? null,
+    decidedBy: row.decided_by,
+    decidedAt: row.decided_at?.toISOString() ?? null,
+    decisionReason: row.decision_reason,
+    lineCount: row.line_count,
+    totalUnits: Number(row.total_units),
+    totalUnitsReceived: Number(row.total_units_received),
+    totalCents: Number(row.total_cents),
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+export function toPurchaseOrderLine(row: PurchaseOrderLineRow): PurchaseOrderLine {
+  return {
+    id: row.id,
+    lineNumber: row.line_number,
+    skuId: row.sku_id,
+    skuCode: row.sku_code,
+    skuName: row.sku_name,
+    unit: row.unit,
+    quantityOrdered: row.quantity_ordered,
+    quantityReceived: row.quantity_received,
+    quantityOutstanding: row.quantity_ordered - row.quantity_received,
+    unitCostCents: row.unit_cost_cents,
+    lineTotalCents: Number(row.line_total_cents),
+  };
+}
+
+/** One entry of a record's audit trail. */
+export interface AuditEvent {
+  id: string;
+  entityType: string;
+  entityId: string;
+  /** e.g. `purchase_order.approved` */
+  action: string;
+  actorId: string;
+  fromStatus: string | null;
+  toStatus: string | null;
+  reason: string | null;
+  details: Record<string, unknown>;
+  occurredAt: string;
+}
+
+export interface AuditEventRow {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  action: string;
+  actor_id: string;
+  from_status: string | null;
+  to_status: string | null;
+  reason: string | null;
+  details: Record<string, unknown>;
+  occurred_at: Date;
+}
+
+export function toAuditEvent(row: AuditEventRow): AuditEvent {
+  return {
+    id: row.id,
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    action: row.action,
+    actorId: row.actor_id,
+    fromStatus: row.from_status,
+    toStatus: row.to_status,
+    reason: row.reason,
+    details: row.details,
+    occurredAt: row.occurred_at.toISOString(),
+  };
+}
+
+/** One line of a delivery: how many units arrived for one order line. */
+export interface NewReceiptLine {
+  lineId: string;
+  quantity: number;
+}
+
+/** Body of `POST .../purchase-orders/:id/receipts`. */
+export interface NewReceipt {
+  lines: NewReceiptLine[];
+  /** Supplier's delivery note or packing slip number. */
+  reference: string | null;
+  notes: string | null;
+  /** When the goods arrived (ISO 8601); `null` = now. */
+  receivedAt: string | null;
+}
+
+export interface ReceiptLine {
+  purchaseOrderLineId: string;
+  lineNumber: number;
+  skuId: string;
+  skuCode: string;
+  quantity: number;
+  /** The `receipt` event this line wrote to the inventory ledger. */
+  inventoryEventId: string;
+}
+
+export interface Receipt {
+  id: string;
+  purchaseOrderId: string;
+  reference: string | null;
+  notes: string | null;
+  receivedBy: string;
+  receivedAt: string;
+  recordedAt: string;
+  lines: ReceiptLine[];
+}
+
+export interface RecordedReceipt {
+  receipt: Receipt;
+  order: PurchaseOrder;
+  /** True when the Idempotency-Key was seen before and nothing new was booked. */
+  replayed: boolean;
+}
+
+export interface ReceiptRow {
+  id: string;
+  purchase_order_id: string;
+  reference: string | null;
+  notes: string | null;
+  received_by: string;
+  received_at: Date;
+  recorded_at: Date;
+  request_hash: string;
+}
+
+export interface ReceiptLineRow {
+  receipt_id: string;
+  purchase_order_line_id: string;
+  line_number: number;
+  sku_id: string;
+  sku_code: string;
+  quantity: number;
+  inventory_event_id: string;
+}
+
+export function toReceipt(row: ReceiptRow, lines: ReceiptLineRow[]): Receipt {
+  return {
+    id: row.id,
+    purchaseOrderId: row.purchase_order_id,
+    reference: row.reference,
+    notes: row.notes,
+    receivedBy: row.received_by,
+    receivedAt: row.received_at.toISOString(),
+    recordedAt: row.recorded_at.toISOString(),
+    lines: lines
+      .filter((l) => l.receipt_id === row.id)
+      .map((l) => ({
+        purchaseOrderLineId: l.purchase_order_line_id,
+        lineNumber: l.line_number,
+        skuId: l.sku_id,
+        skuCode: l.sku_code,
+        quantity: l.quantity,
+        inventoryEventId: l.inventory_event_id,
+      })),
+  };
+}

@@ -39,6 +39,7 @@ Requests authenticate with `Authorization: Bearer <token>`. Tokens live in
 | `GET /v1/organizations/:orgId/membership` | Member of `:orgId` (any role) |
 | Catalog routes (below) | Member of `:orgId`; writes need `manager` |
 | `POST /v1/organizations/:orgId/inventory/movements` | `manager` |
+| Purchase order routes (below) | Member of `:orgId`; drafts, submitting, cancelling and reopening need `buyer`; approving and rejecting need `manager` |
 
 `TenantGuard` runs on these routes. A missing or invalid token gets `401`.
 Routes marked `@RequireRole(role)` also need a membership in `:orgId` with at
@@ -132,6 +133,14 @@ adjustment or correction that would do so fails as a whole and returns
 are serialized by the balance row lock, so two issues cannot both spend the
 same stock. The rule checks the current total; a back-dated `occurredAt` is
 not replayed against older balances.
+
+Migration `0010_balance_trigger_drawdown` replaces the trigger function from
+0005. The original upsert proposed the movement's own delta as a new row, and
+PostgreSQL checks `CHECK` constraints before it detects the conflict, so every
+issue and negative adjustment was refused even with stock on hand. The trigger
+now updates an existing balance first and only inserts the first balance for
+a SKU and warehouse (retrying the update if another transaction created it at
+the same moment).
 
 ### `GET /v1/organizations/:orgId/inventory`
 
@@ -280,6 +289,140 @@ Every batch response carries `apply` (`requestedBy`, `queuedAt`, `startedAt`,
 | `409 import_already_applied` | The batch was applied already |
 | `422 nothing_to_apply` | The batch has no valid rows |
 
+## Purchase orders
+
+Migration `0008_purchase_orders` adds `purchase_orders` and
+`purchase_order_lines`. An order is raised against one supplier for delivery
+to one warehouse; supplier, warehouse and SKUs must be active records of the
+same organization (composite foreign keys, checked and share-locked when the
+order is written). Orders are numbered per organization (`PO-000001`, ...)
+from `purchase_order_numbers`; the counter row lock keeps numbers unique when
+buyers create orders at the same time.
+
+Each line is one SKU (at most once per order) with `quantityOrdered`
+(1–1,000,000) and `unitCostCents`. The unit cost defaults to the SKU's
+catalog cost at the time the line is written, so later price changes don't
+rewrite existing orders. `lineTotalCents` is a generated column, capped at
+10^13 cents per line, so order totals are always exact numbers.
+
+New orders are `draft`. A trigger only lets lines be added, removed or
+re-priced while the order is a draft. Orders and lines are never deleted.
+
+All routes are under `/v1/organizations/:orgId/purchase-orders`.
+
+| Route | Role | Notes |
+|---|---|---|
+| `GET /` | viewer | Newest first, without lines but with `lineCount`, `totalUnits`, `totalCents`; filters `status`, `supplierId`, `warehouseId`; `limit` 1–200 (default 50), `offset`, `page.hasMore` |
+| `GET /:id` | viewer | Order with its lines (SKU code, name and unit included); `404` for unknown, malformed or other-tenant ids |
+| `POST /` | buyer | Creates a draft: `supplierId`, `warehouseId`, optional `expectedOn` (`YYYY-MM-DD`) and `notes`, `lines` (1–200 of `{ skuId, quantity, unitCostCents? }`); `201` |
+| `PUT /:id/lines` | buyer | `{ lines }` replaces every line of a draft; `409 purchase_order_not_editable` once the order left draft |
+| `POST /:id/submit` | buyer | `draft` → `submitted`; optional `{ reason }` |
+| `POST /:id/approve` | manager | `submitted` → `approved`; optional `{ reason }` |
+| `POST /:id/reject` | manager | `submitted` → `rejected`; `{ reason }` required |
+| `POST /:id/cancel` | buyer | `draft` or `submitted` → `cancelled`; `approved` → `cancelled` needs a manager; `{ reason }` required |
+| `POST /:id/reopen` | buyer | `rejected` → `draft`, so the lines can be fixed and the order submitted again |
+| `GET /:id/events` | viewer | The order's audit trail, oldest first |
+| `POST /:id/receipts` | buyer | Books a delivery (possibly partial) and adds it to stock; `Idempotency-Key` header required; see [Receiving](#receiving) |
+| `GET /:id/receipts` | viewer | Deliveries booked against the order, oldest first, with their lines |
+
+```json
+{
+  "supplierId": "1f4b…",
+  "warehouseId": "8a02…",
+  "expectedOn": "2026-12-04",
+  "lines": [
+    { "skuId": "c3d9…", "quantity": 400 },
+    { "skuId": "52ae…", "quantity": 24, "unitCostCents": 225 }
+  ]
+}
+```
+
+Invalid fields are reported with their line, e.g. `lines[1].quantity`. A SKU
+listed twice, or a supplier, warehouse or SKU that is archived or belongs to
+another organization, returns `422`.
+
+### Approval workflow
+
+Migration `0009_purchase_order_approvals` adds the approval columns and the
+audit trail.
+
+```
+draft ──submit──▶ submitted ──approve──▶ approved ──(receipts)──▶ partially_received ──▶ received
+  │                 │   └──reject──▶ rejected ──reopen──▶ draft
+  └──cancel──▶ cancelled ◀──cancel── submitted / approved
+```
+
+- The rules live in `src/purchasing/purchasing.state-machine.ts`. A step that
+  doesn't apply to the current status gets `409 invalid_status_transition`; a
+  role that is too low gets `403 forbidden`.
+- Four-eyes rule: whoever submitted an order can't approve or reject it, even
+  as an owner (`403 self_decision_not_allowed`). They can still cancel it.
+- The order row is locked while a step runs, so two managers deciding at the
+  same time are serialized: one wins, the other gets `409`.
+- Orders show `submittedBy`/`submittedAt`, `decidedBy`/`decidedAt` and
+  `decisionReason`. Reopening clears them; the history stays in the audit trail.
+- The database backs this up: a trigger refuses any status change that isn't
+  an edge of the diagram (including the receiving edges used later), and a
+  check constraint refuses a decision by the submitter.
+
+Every change to an order (created, lines replaced, each status step) appends
+a row to `audit_events` in the same transaction: action (e.g.
+`purchase_order.approved`), actor, from/to status, reason and the order
+number, line count and total. The table is tenant-scoped and append-only
+(`UPDATE`, `DELETE` and `TRUNCATE` are refused by triggers).
+
+```json
+{
+  "data": [
+    { "action": "purchase_order.submitted", "actorId": "…", "fromStatus": "draft", "toStatus": "submitted", "reason": null, "details": { "number": "PO-000001", "lineCount": 2, "totalCents": 39400 }, "occurredAt": "…" },
+    { "action": "purchase_order.approved", "actorId": "…", "fromStatus": "submitted", "toStatus": "approved", "reason": "Covers the December demand spike", "details": { "number": "PO-000001", "lineCount": 2, "totalCents": 39400 }, "occurredAt": "…" }
+  ]
+}
+```
+
+### Receiving
+
+Migration `0011_purchase_order_receipts` adds `purchase_order_receipts`
+(one row per delivery), `purchase_order_receipt_lines` and a running
+`quantity_received` per order line.
+
+```bash
+curl -X POST .../purchase-orders/$PO/receipts \
+  -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: dn-7781-wh1" \
+  -H "Content-Type: application/json" \
+  -d '{ "lines": [{ "lineId": "…", "quantity": 250 }], "reference": "DN-7781" }'
+```
+
+- Body: `lines` (1–200 of `{ lineId, quantity }`, each order line at most
+  once), optional `reference` (delivery note, ≤ 120 chars), `notes` and
+  `receivedAt` (ISO 8601 with offset, not in the future; default now).
+- Only `approved` and `partially_received` orders accept deliveries
+  (`409 purchase_order_not_receivable` otherwise). The first delivery moves
+  the order to `partially_received`; it becomes `received` once every line
+  has its full quantity, also when that happens in one delivery.
+- Over-receipt is refused, not tolerated: a quantity above what is still
+  outstanding on its line returns `409 over_receipt` naming the line
+  (`lines[0].quantity`). A `CHECK (quantity_received BETWEEN 0 AND
+  quantity_ordered)` backs this up in the database.
+- Each receipt line appends one `receipt` event to the inventory ledger
+  (reference = order number, `occurred_at` = `receivedAt`) in the same
+  transaction as the receipt, so stock balances and the order can't disagree.
+  The receipt line keeps the event id.
+- The order row is locked while a delivery is booked, so two deliveries for
+  the same order run one after the other and can't over-receive between them.
+- Retrying with the same `Idempotency-Key` and body returns the original
+  receipt (`200`, `Idempotent-Replayed: true`) and adds nothing, even after the
+  order has been received in full. The same key with another body, or for
+  another order, returns `409 idempotency_conflict`.
+- Orders and lines now include `totalUnitsReceived`, `quantityReceived` and
+  `quantityOutstanding`. Each delivery appends a
+  `purchase_order.goods_received` audit event (status change, receipt id,
+  units received). Receipts and their lines are append-only.
+
+Not handled yet: closing an order short when the supplier won't ship the
+rest, returns to the supplier, and correcting a receipt booked with the wrong
+quantity (today that is an inventory `correction` movement).
+
 ## Errors
 
 Every error response has the same shape:
@@ -298,9 +441,9 @@ Every error response has the same shape:
 | Status | `code` |
 |---|---|
 | 401 | `unauthorized` |
-| 403 | `forbidden` |
+| 403 | `forbidden`, `self_decision_not_allowed` |
 | 404 | `not_found` |
-| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied` |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied`, `purchase_order_not_editable`, `invalid_status_transition`, `purchase_order_not_receivable`, `over_receipt` |
 | 422 | `validation_failed` (with `details`), `nothing_to_apply` |
 | 500 | `internal_error` |
 
@@ -331,6 +474,18 @@ same `Idempotency-Key` (one event, the rest replayed), key conflicts and
 per-organization keys, the negative-stock rule for issues, adjustments and
 corrections, concurrent issues racing for the same stock, and the
 append-only ledger with an empty `stock_balance_drift` view.
+
+`purchase-order-approvals.db.spec.ts` covers the approval flow end to end,
+the reopen/resubmit cycle, two managers deciding at once, the status-transition
+trigger, the four-eyes constraint and the append-only audit trail.
+
+`purchase-order-receipts.db.spec.ts` covers a partial shipment followed by
+the rest (ledger events, stock balances, statuses, audit trail), racing
+retries with one key adding stock once, key reuse, two deliveries racing for
+the last units, receiving before approval, and the database constraints.
+
+`test:db` runs the specs one at a time (`--runInBand`), since each migrates
+its own schema from scratch.
 
 ## Migrations
 
