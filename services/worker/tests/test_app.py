@@ -1,10 +1,11 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from supplypilot_worker.app import create_app
 from supplypilot_worker.lead_times import OrderDelivery
+from supplypilot_worker.proposals import StockPosition
 from supplypilot_worker.repository import Supplier
 from supplypilot_worker.settings import Settings
 
@@ -17,6 +18,12 @@ NEW = "5b8e0c1e-3f55-4b8e-8a40-000000000003"
 OLD = "5b8e0c1e-3f55-4b8e-8a40-000000000004"
 FOREIGN = "5b8e0c1e-3f55-4b8e-8a40-000000000005"
 AS_OF = datetime(2026, 6, 30, tzinfo=timezone.utc)
+WH = "7c1d2e3f-0000-4000-8000-000000000001"
+SKU_LOW = "9a0b1c2d-0000-4000-8000-000000000001"
+SKU_FULL = "9a0b1c2d-0000-4000-8000-000000000002"
+SKU_NEW = "9a0b1c2d-0000-4000-8000-000000000003"
+SKU_ORPHAN = "9a0b1c2d-0000-4000-8000-000000000004"
+SKU_FOREIGN = "9a0b1c2d-0000-4000-8000-000000000005"
 
 
 class FakeSource:
@@ -35,6 +42,17 @@ class FakeSource:
         for i, days in enumerate([2, 15, 4, 20, -1]):
             self.add(ORG, ERRATIC, 10 + i, start + timedelta(days=7 * i), days)
         self.add(OTHER_ORG, FOREIGN, 99, start, 3)
+        self.positions = {
+            ORG: [StockPosition(SKU_LOW, "SKU-LOW", WH, "WH-MAIN", STEADY, False, 10, 0),
+                  StockPosition(SKU_FULL, "SKU-FULL", WH, "WH-MAIN", STEADY, False, 500, 0),
+                  StockPosition(SKU_NEW, "SKU-NEW", WH, "WH-MAIN", NEW, False, 0, 0),
+                  StockPosition(SKU_ORPHAN, "SKU-ORPHAN", WH, "WH-MAIN", None, False, 0, 0)],
+            OTHER_ORG: [StockPosition(SKU_FOREIGN, "SKU-X", WH, "WH-X", FOREIGN, False, 0, 0)],
+        }
+        self.issues = {(org, sku): {date(2026, 6, day): 4 for day in range(1, 31)}
+                       for org, sku in [(ORG, SKU_LOW), (ORG, SKU_FULL), (ORG, SKU_NEW),
+                                        (OTHER_ORG, SKU_FOREIGN)]}
+        self.issue_calls = []
 
     def add(self, org, supplier, n, approved, days, expected=None):
         self.rows.append((org, OrderDelivery(f"po-{n}", f"PO-{n:06d}", supplier, approved,
@@ -42,6 +60,14 @@ class FakeSource:
 
     def organization_exists(self, organization_id):
         return organization_id in self.orgs
+
+    def stock_positions(self, organization_id):
+        return list(self.positions.get(organization_id, []))
+
+    def daily_issues(self, organization_id, occurred_from, occurred_to):
+        self.issue_calls.append((organization_id, occurred_from, occurred_to))
+        return {(sku, WH): days for (org, sku), days in self.issues.items()
+                if org == organization_id}
 
     def suppliers(self, organization_id):
         return list(self.orgs.get(organization_id, []))
@@ -242,3 +268,74 @@ def test_reorder_calculation_validation(client, patch, field):
     error = res.json()["error"]
     assert error["code"] == "validation_failed"
     assert any(d["field"].startswith(field) for d in error["details"])
+
+
+CANDIDATES = f"/v1/organizations/{ORG}/reorder-candidates"
+RUN = {"asOf": "2026-06-30T18:00:00Z", "demandWindowDays": 30}
+
+
+def test_reorder_candidates_need_the_token(client):
+    assert client.post(CANDIDATES, json=RUN).status_code == 401
+
+
+def test_reorder_candidates_list_low_stock_with_evidence(client, source):
+    res = client.post(CANDIDATES, json=RUN, headers=AUTH)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["organizationId"] == ORG
+    assert body["asOf"] == "2026-06-30T18:00:00Z"
+    assert body["parameters"] == {
+        "demandWindowDays": 30, "demandFrom": "2026-06-01T00:00:00Z",
+        "leadTimeWindowDays": 365, "leadTimeFrom": "2025-06-30T18:00:00Z",
+        "serviceLevel": 0.95, "reviewPeriodDays": 7.0,
+    }
+    # Demand is read for whole UTC days, up to the run time.
+    assert source.issue_calls[-1] == (ORG, datetime(2026, 6, 1, tzinfo=timezone.utc),
+                                      datetime(2026, 6, 30, 18, tzinfo=timezone.utc))
+
+    [candidate] = body["candidates"]
+    assert candidate["skuId"] == SKU_LOW and candidate["supplierId"] == STEADY
+    assert (candidate["onHand"], candidate["onOrder"]) == (10, 0)
+    assert candidate["leadTime"]["sampleCount"] == 5
+    calc = candidate["calculation"]
+    assert calc["shouldReorder"] is True
+    assert calc["evidence"]["meanDailyDemand"] == 4.0
+    assert calc["evidence"]["leadTimeDays"] == 6.4
+    assert calc["suggestedOrderQty"] == calc["orderUpTo"] - 10
+    assert len(candidate["digest"]) == 64
+
+    reasons = {s["skuCode"]: s["reason"] for s in body["skipped"]}
+    assert reasons == {"SKU-FULL": "above_reorder_point", "SKU-NEW": "no_lead_time_history",
+                       "SKU-ORPHAN": "no_preferred_supplier"}
+    assert SKU_FOREIGN not in res.text
+
+
+def test_digest_ignores_the_run_time_but_follows_the_facts(client, source):
+    first = client.post(CANDIDATES, json=RUN, headers=AUTH).json()["candidates"][0]["digest"]
+    later = {**RUN, "asOf": "2026-06-30T23:00:00Z"}
+    assert client.post(CANDIDATES, json=later, headers=AUTH).json()["candidates"][0]["digest"] == first
+
+    source.positions[ORG][0] = StockPosition(SKU_LOW, "SKU-LOW", WH, "WH-MAIN", STEADY, False, 9, 0)
+    changed = client.post(CANDIDATES, json=RUN, headers=AUTH).json()["candidates"][0]
+    assert changed["onHand"] == 9 and changed["digest"] != first
+
+
+@pytest.mark.parametrize("body, field", [
+    ({"serviceLevel": 0.4}, "serviceLevel"),
+    ({"demandWindowDays": 7}, "demandWindowDays"),
+    ({"reviewPeriodDays": 91}, "reviewPeriodDays"),
+    ({"leadTimeWindowDays": 0}, "leadTimeWindowDays"),
+    ({"skuIds": []}, "skuIds"),
+])
+def test_reorder_candidates_validate_the_settings(client, body, field):
+    res = client.post(CANDIDATES, json=body, headers=AUTH)
+    assert res.status_code == 422
+    assert [d["field"] for d in res.json()["error"]["details"]] == [field]
+
+
+def test_reorder_candidates_need_an_offset_and_a_known_organization(client):
+    res = client.post(CANDIDATES, json={"asOf": "2026-06-30T18:00:00"}, headers=AUTH)
+    assert res.status_code == 422
+    unknown = "0d6f1a52-6a0e-4a43-9d2b-1f6a7c1e0099"
+    res = client.post(f"/v1/organizations/{unknown}/reorder-candidates", json=RUN, headers=AUTH)
+    assert res.status_code == 404

@@ -37,6 +37,7 @@ ignored, so a fixed `asOf` gives a reproducible answer.
 | GET | `/v1/organizations/{orgId}/supplier-lead-times` | Every active supplier, plus archived ones with history in the window |
 | GET | `/v1/organizations/{orgId}/suppliers/{supplierId}/lead-time` | Statistics plus the 100 most recent samples |
 | POST | `/v1/reorder-calculations` | Reorder-point calculator (below); needs no database |
+| POST | `/v1/organizations/{orgId}/reorder-candidates` | Which stocked SKUs need a reorder now (below) |
 
 `/v1` routes need `Authorization: Bearer <WORKER_SERVICE_TOKEN>`: 401 for a
 missing or wrong token, 503 if the worker has no token configured (or, for the lead-time routes, no
@@ -82,6 +83,40 @@ no demand the calculator never reorders.
 Warnings flag thin evidence: `short_demand_history` (fewer than 14 days),
 `nominal_lead_time`, `no_demand`, `out_of_stock`. Invalid inputs are 422
 `validation_failed` with the offending field in `details`.
+
+## Reorder candidates
+
+`POST /v1/organizations/{orgId}/reorder-candidates` runs the calculator for
+every stocked SKU at every active warehouse and returns the pairs that need a
+reorder now. It only reads; the API stores the candidates as reorder
+proposals that a manager approves or rejects.
+
+```json
+{ "asOf": "2026-11-27T10:00:00Z", "demandWindowDays": 90, "leadTimeWindowDays": 365,
+  "serviceLevel": 0.95, "reviewPeriodDays": 7 }
+```
+
+All fields are optional (`asOf` defaults to now and needs an offset). For each
+pair (`stock_balances` row of an active SKU at an active warehouse):
+
+- **Demand** – units issued per UTC day over the last `demandWindowDays`
+  days up to `asOf`, quiet days counted as zero.
+- **Lead time** – the SKU's preferred supplier's observed lead times over
+  `leadTimeWindowDays` (see above); one sample is used with no spread.
+- **Position** – current on hand plus units still outstanding on open orders
+  for that warehouse (draft, submitted, approved, partially received). Stock
+  is read as it is now, not as of `asOf`.
+
+Pairs that need a reorder come back in `candidates` with `onHand`, `onOrder`,
+the supplier's `leadTime` statistics, the full `calculation` (as from
+`/v1/reorder-calculations`) and a SHA-256 `digest` of all of that. The digest
+leaves out the run time, so a later run over the same facts gives the same
+digest and the API keeps the open proposal. Every other pair is in `skipped`
+with a reason: `no_preferred_supplier`, `supplier_archived`,
+`no_lead_time_history`, `no_demand` or `above_reorder_point`.
+
+Order multiples and minimum order quantities are 1 for now; the catalog has
+no pack sizes yet.
 
 ## Running
 

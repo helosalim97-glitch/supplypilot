@@ -104,6 +104,59 @@ class Org:
             self.conn.execute("UPDATE purchase_orders SET status = %s WHERE id = %s", (status, po))
 
 
+def move(org, sku, warehouse, event_type, delta, at):
+    key = f"mv-{uuid.uuid4().hex}"
+    org.conn.execute("""INSERT INTO inventory_events
+                          (organization_id, sku_id, warehouse_id, event_type, quantity_delta,
+                           idempotency_key, request_hash, created_by, occurred_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                     (org.id, sku, warehouse, event_type, delta, key,
+                      hashlib.sha256(key.encode()).hexdigest(), org.buyer, at))
+
+
+def test_reads_stock_positions_with_open_orders(conn, source):
+    org = Org(conn)
+    sup = org.supplier("SUP-A")
+    conn.execute("UPDATE skus SET preferred_supplier_id = %s WHERE id = %s", (sup, org.sku))
+    other_wh = org.one("""INSERT INTO warehouses (organization_id, code, name)
+                          VALUES (%s, 'WH2', 'Second warehouse') RETURNING id::text""", org.id)
+    move(org, org.sku, org.warehouse, "receipt", 50, T0)
+    move(org, org.sku, other_wh, "receipt", 5, T0)
+
+    org.order(sup)  # submitted, 10 units to WH1: counts as on order
+    received = org.order(sup, T0)
+    org.receive(received, T0 + timedelta(days=2), final=True)  # fully received: does not count
+    conn.execute("UPDATE purchase_order_lines SET quantity_received = 10 WHERE purchase_order_id = %s",
+                 (received,))
+
+    positions = {p.warehouse_code: p for p in source.stock_positions(org.id)}
+    assert set(positions) == {"WH1", "WH2"}
+    wh1 = positions["WH1"]
+    assert (wh1.sku_code, wh1.supplier_id, wh1.supplier_archived) == ("SKU-1", sup, False)
+    assert (wh1.on_hand, wh1.on_order) == (50, 10)
+    assert (positions["WH2"].on_hand, positions["WH2"].on_order) == (5, 0)
+
+    conn.execute("UPDATE suppliers SET archived_at = now() WHERE id = %s", (sup,))
+    conn.execute("UPDATE warehouses SET archived_at = now() WHERE id = %s", (other_wh,))
+    [only] = source.stock_positions(org.id)
+    assert only.warehouse_code == "WH1" and only.supplier_archived is True
+    assert source.stock_positions(Org(conn).id) == []
+
+
+def test_sums_issues_per_utc_day(conn, source):
+    org = Org(conn)
+    move(org, org.sku, org.warehouse, "receipt", 100, T0)
+    move(org, org.sku, org.warehouse, "issue", -3, T0 + timedelta(hours=1))
+    move(org, org.sku, org.warehouse, "issue", -4, T0 + timedelta(hours=14, minutes=59))  # 23:59 UTC
+    move(org, org.sku, org.warehouse, "issue", -5, T0 + timedelta(hours=15))  # next UTC day
+    move(org, org.sku, org.warehouse, "adjustment", -2, T0 + timedelta(hours=2))  # not demand
+    move(org, org.sku, org.warehouse, "issue", -9, T0 + timedelta(days=40))  # after the window
+
+    issues = source.daily_issues(org.id, T0 - timedelta(days=1), T0 + timedelta(days=30))
+    assert issues == {(org.sku, org.warehouse): {date(2026, 5, 4): 7, date(2026, 5, 5): 5}}
+    assert source.daily_issues(Org(conn).id, *WINDOW) == {}
+
+
 def test_reads_first_delivery_per_approved_order(conn, source):
     org = Org(conn)
     sup = org.supplier("SUP-A")

@@ -17,6 +17,9 @@ pnpm api:dev                  # http://localhost:3001/v1/health
 | `DATABASE_URL` | — (required) | PostgreSQL connection string |
 | `IMPORT_WORKER_POLL_MS` | `2000` | How often the import worker looks for queued imports (0–60000; `0` turns it off) |
 | `IMPORT_STALE_AFTER_SECONDS` | `600` | An import stuck in `applying` this long is taken over (30–86400) |
+| `WORKER_URL` | — | Base URL of the forecasting worker (`services/worker`); without it reorder runs answer 503 |
+| `WORKER_SERVICE_TOKEN` | — | Shared bearer token for the worker (at least 32 characters) |
+| `WORKER_TIMEOUT_MS` | `15000` | How long a reorder run waits for the worker (100–120000) |
 
 ## Health
 
@@ -423,6 +426,85 @@ Not handled yet: closing an order short when the supplier won't ship the
 rest, returns to the supplier, and correcting a receipt booked with the wrong
 quantity (today that is an inventory `correction` movement).
 
+## Reorder proposals
+
+A reorder proposal is the worker's recommendation to reorder one SKU for one
+warehouse from its preferred supplier, stored with the numbers behind it
+(migration `0012_reorder_proposals`). It never orders anything by itself:
+approving a proposal raises a **draft** purchase order, which still needs the
+usual submit and four-eyes approval.
+
+| Method | Path | Role |
+|---|---|---|
+| `POST` | `/v1/organizations/:orgId/reorders/runs` | manager |
+| `GET` | `/v1/organizations/:orgId/reorders` | viewer |
+| `GET` | `/v1/organizations/:orgId/reorders/:id` | viewer |
+| `POST` | `/v1/organizations/:orgId/reorders/:id/decision` | manager |
+
+### Runs
+
+```bash
+curl -X POST .../reorders/runs -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{ "demandWindowDays": 30, "serviceLevel": 0.95 }'
+```
+
+- Optional settings: `demandWindowDays` (14–365, default 90),
+  `leadTimeWindowDays` (1–1095, default 365), `serviceLevel` (0.5–0.999,
+  default 0.95), `reviewPeriodDays` (0–90, default 7).
+- The API asks the worker (`POST /v1/organizations/:orgId/reorder-candidates`)
+  which stocked SKUs are at or below their reorder point, checks the answer
+  (ids, whole quantities, digest) and stores it in one transaction. Runs for
+  the same organization take an advisory lock and run one after the other.
+- Each SKU/warehouse pair has at most one `pending` proposal (partial unique
+  index). A pair whose numbers are unchanged keeps its open proposal
+  (`unchanged`); changed numbers supersede it with a new one; an open proposal
+  the run no longer recommends is superseded too.
+- Pairs that produce no proposal are listed in `skipped` with a reason:
+  `no_preferred_supplier`, `supplier_archived`, `no_lead_time_history`,
+  `no_demand`, `above_reorder_point`, `quantity_too_large` (above the
+  1,000,000-unit line limit) or `changed_during_run` (archived, or approved
+  by a manager while the worker was calculating).
+- `503 worker_unavailable` when the worker isn't configured, can't be
+  reached or answers with something unusable; nothing is stored then.
+
+Response: `{ calculatedAt, parameters, created, unchanged, superseded, skipped }`.
+
+### Proposals
+
+`GET .../reorders` lists newest first with `status`, `skuId`, `warehouseId`,
+`limit` (1–200, default 50) and `offset`. Each proposal has the suggested
+quantity, `onHand`, `onOrder`, `reorderPoint`, `safetyStock`, `orderUpTo`,
+`warnings`, the inputs digest and an `evidence` object with every
+intermediate value (daily demand mean and spread, the supplier's lead-time
+statistics, z, lead-time demand, days of cover, run settings).
+
+`onOrder` counts units still outstanding on open orders for that warehouse,
+drafts included, so an approved proposal's draft keeps the same pair from
+being proposed again.
+
+### Decisions
+
+```bash
+curl -X POST .../reorders/$ID/decision -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "decision": "approve", "quantity": 120, "expectedOn": "2026-12-10" }'
+```
+
+- `approve`: optional `quantity` (1–1,000,000, defaults to the suggestion),
+  `expectedOn` and `reason` (becomes the order's note). Raises a draft order
+  for the preferred supplier with the SKU's current unit cost, in the same
+  transaction as the decision; the response has both the proposal and the
+  order. The order's `purchase_order.created` audit event names the proposal.
+- `reject`: needs a `reason`; `quantity` and `expectedOn` are refused.
+- The proposal row is locked, so of two concurrent decisions exactly one
+  wins; the other (and any later one) gets `409 proposal_not_pending`.
+  `409 proposal_outdated` if the SKU, warehouse or supplier was archived
+  since the run.
+- Each step is in the audit trail as `reorder_proposal.created`,
+  `.superseded`, `.approved` or `.rejected`. A trigger refuses any other
+  change: proposals are never edited or deleted, and a decided or superseded
+  proposal never changes again.
+
 ## Errors
 
 Every error response has the same shape:
@@ -443,9 +525,10 @@ Every error response has the same shape:
 | 401 | `unauthorized` |
 | 403 | `forbidden`, `self_decision_not_allowed` |
 | 404 | `not_found` |
-| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied`, `purchase_order_not_editable`, `invalid_status_transition`, `purchase_order_not_receivable`, `over_receipt` |
+| 409 | `duplicate_code`, `idempotency_conflict`, `insufficient_stock`, `import_already_applied`, `purchase_order_not_editable`, `invalid_status_transition`, `purchase_order_not_receivable`, `over_receipt`, `proposal_not_pending`, `proposal_outdated` |
 | 422 | `validation_failed` (with `details`), `nothing_to_apply` |
 | 500 | `internal_error` |
+| 503 | `worker_unavailable` |
 
 Each request gets a correlation id: the caller's `X-Request-Id` if it is 8–128
 characters of letters, digits, `.`, `_` or `-`, otherwise a new UUID. It is
@@ -483,6 +566,12 @@ trigger, the four-eyes constraint and the append-only audit trail.
 the rest (ledger events, stock balances, statuses, audit trail), racing
 retries with one key adding stock once, key reuse, two deliveries racing for
 the last units, receiving before approval, and the database constraints.
+
+`reorders.db.spec.ts` covers runs keeping, replacing and retiring open
+proposals, concurrent runs (never two open proposals for a pair), approving
+into a draft order, three concurrent decisions (one wins, at most one order),
+pairs approved during a run, archived suppliers, tenant scoping and the
+guard trigger.
 
 `test:db` runs the specs one at a time (`--runInBand`), since each migrates
 its own schema from scratch.

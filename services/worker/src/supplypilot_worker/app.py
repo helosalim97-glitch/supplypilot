@@ -7,7 +7,9 @@ the per-user permission checks itself. Errors use the API's envelope,
 
 # No `from __future__ import annotations` here: FastAPI resolves the route
 # signatures' Annotated aliases, which are local to create_app().
+import hashlib
 import hmac
+import json
 import logging
 import re
 import uuid
@@ -21,9 +23,13 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .lead_times import LeadTimeSample, LeadTimeStats, build_samples, summarize_samples
-from .reorder import (MAX_DEMAND_DAYS, LeadTime, ReorderInput, ReorderInputError,
+from .proposals import (MAX_DEMAND_WINDOW_DAYS, MIN_DEMAND_WINDOW_DAYS, Candidate,
+                        CandidateParams, Skipped, StockPosition, plan_candidates)
+from .reorder import (MAX_DEMAND_DAYS, MAX_REVIEW_DAYS, MAX_SERVICE_LEVEL, MIN_SERVICE_LEVEL,
+                      LeadTime, ReorderInput, ReorderInputError,
                       ReorderResult, calculate)
-from .repository import LeadTimeSource, PostgresLeadTimeSource, Supplier, read_only_connection
+from .repository import (LeadTimeSource, PostgresLeadTimeSource, ReorderSource, Supplier,
+                         read_only_connection)
 from .settings import Settings
 
 logger = logging.getLogger("supplypilot_worker")
@@ -62,6 +68,21 @@ class ReorderCalculationBody(BaseModel):
     order_multiple: int = Field(1, alias="orderMultiple", ge=1)
 
 
+class ReorderCandidatesBody(BaseModel):
+    """Settings for one reorder run over an organization's stocked SKUs."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    as_of: datetime | None = Field(None, alias="asOf")
+    demand_window_days: int = Field(90, alias="demandWindowDays", ge=MIN_DEMAND_WINDOW_DAYS,
+                                    le=MAX_DEMAND_WINDOW_DAYS)
+    lead_time_window_days: int = Field(DEFAULT_WINDOW_DAYS, alias="leadTimeWindowDays", ge=1,
+                                       le=MAX_WINDOW_DAYS)
+    service_level: float = Field(0.95, alias="serviceLevel", ge=MIN_SERVICE_LEVEL,
+                                 le=MAX_SERVICE_LEVEL)
+    review_period_days: float = Field(7, alias="reviewPeriodDays", ge=0, le=MAX_REVIEW_DAYS)
+
+
 class WorkerError(Exception):
     def __init__(self, status: int, code: str, message: str) -> None:
         super().__init__(message)
@@ -78,7 +99,7 @@ def _envelope(request: Request, status: int, code: str, message: str,
     return JSONResponse({"error": error}, status_code=status)
 
 
-def create_app(settings: Settings | None = None, source: LeadTimeSource | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, source: ReorderSource | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     if source is None and settings.database_url:
         source = PostgresLeadTimeSource(read_only_connection(settings.database_url))
@@ -131,13 +152,13 @@ def create_app(settings: Settings | None = None, source: LeadTimeSource | None =
                 token.strip().encode(), settings.service_token.encode()):
             raise WorkerError(401, "unauthorized", "Missing or invalid service token")
 
-    def require_service(request: Request) -> LeadTimeSource:
+    def require_service(request: Request) -> ReorderSource:
         require_token(request)
         if source is None:
             raise WorkerError(503, "service_unavailable", "Worker is not configured")
         return source
 
-    Source = Annotated[LeadTimeSource, Depends(require_service)]
+    Source = Annotated[ReorderSource, Depends(require_service)]
     Token = Annotated[None, Depends(require_token)]
     WindowDays = Annotated[int, Query(alias="windowDays", ge=1, le=MAX_WINDOW_DAYS)]
     AsOf = Annotated[datetime | None, Query(alias="asOf")]
@@ -207,7 +228,80 @@ def create_app(settings: Settings | None = None, source: LeadTimeSource | None =
             order_multiple=body.order_multiple))
         return _reorder_json(result)
 
+    @app.post("/v1/organizations/{organization_id}/reorder-candidates")
+    def reorder_candidates(organization_id: uuid.UUID, body: ReorderCandidatesBody,
+                           src: Source):
+        """Which stocked pairs need a reorder now, each with its full calculation.
+
+        Read-only: the API stores the candidates as proposals for people to decide on.
+        """
+        as_of = body.as_of or datetime.now(timezone.utc)
+        if as_of.tzinfo is None:
+            raise WorkerError(422, "validation_failed", "asOf must include a time zone offset")
+        org = org_or_404(src, organization_id)
+
+        # Demand: whole UTC days ending with as_of's day (that day up to as_of).
+        last_day = as_of.astimezone(timezone.utc).date()
+        demand_from = datetime.combine(last_day - timedelta(days=body.demand_window_days - 1),
+                                       datetime.min.time(), tzinfo=timezone.utc)
+        lead_from = as_of - timedelta(days=body.lead_time_window_days)
+
+        by_supplier: dict[str, list] = {}
+        for delivery in src.deliveries(org, lead_from, as_of):
+            by_supplier.setdefault(delivery.supplier_id, []).append(delivery)
+        lead_times = {}
+        for supplier_id, deliveries in by_supplier.items():
+            samples, excluded = build_samples(deliveries)
+            lead_times[supplier_id] = summarize_samples(samples, excluded)
+
+        params = CandidateParams(demand_window_days=body.demand_window_days,
+                                 service_level=body.service_level,
+                                 review_period_days=body.review_period_days)
+        candidates, skipped = plan_candidates(
+            src.stock_positions(org), src.daily_issues(org, demand_from, as_of), lead_times,
+            params, last_day)
+        return {
+            "organizationId": org,
+            "asOf": _iso(as_of),
+            "parameters": {
+                "demandWindowDays": body.demand_window_days,
+                "demandFrom": _iso(demand_from),
+                "leadTimeWindowDays": body.lead_time_window_days,
+                "leadTimeFrom": _iso(lead_from),
+                "serviceLevel": body.service_level,
+                "reviewPeriodDays": body.review_period_days,
+            },
+            "candidates": [_candidate_json(c) for c in candidates],
+            "skipped": [_skipped_json(s) for s in skipped],
+        }
+
     return app
+
+
+def _position_json(position: StockPosition) -> dict:
+    return {"skuId": position.sku_id, "skuCode": position.sku_code,
+            "warehouseId": position.warehouse_id, "warehouseCode": position.warehouse_code}
+
+
+def _candidate_json(candidate: Candidate) -> dict:
+    position = candidate.position
+    body = {
+        **_position_json(position),
+        "supplierId": position.supplier_id,
+        "onHand": position.on_hand,
+        "onOrder": position.on_order,
+        "leadTime": _stats_json(candidate.lead_time),
+        "calculation": _reorder_json(candidate.result),
+    }
+    # Fingerprint of everything that shapes the proposal, but not of the run
+    # time: a later run over unchanged facts yields the same digest, so the
+    # API keeps the open proposal instead of replacing it.
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return {**body, "digest": hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def _skipped_json(skipped: Skipped) -> dict:
+    return {**_position_json(skipped.position), "reason": skipped.reason}
 
 
 def _reorder_json(result: ReorderResult) -> dict:

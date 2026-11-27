@@ -9,10 +9,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Protocol
 
 from .lead_times import OrderDelivery
+from .proposals import StockPosition
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,13 @@ class LeadTimeSource(Protocol):
                    supplier_id: str | None = None) -> list[OrderDelivery]: ...
 
 
+class ReorderSource(LeadTimeSource, Protocol):
+    def stock_positions(self, organization_id: str) -> list[StockPosition]: ...
+
+    def daily_issues(self, organization_id: str, occurred_from: datetime, occurred_to: datetime
+                     ) -> dict[tuple[str, str], dict[date, int]]: ...
+
+
 # Approved orders that have at least one delivery. Only receipts up to the end
 # of the window count, so a past `asOf` gives the same answer later on.
 DELIVERIES_SQL = """
@@ -48,6 +56,44 @@ SELECT po.id::text, po.number, po.supplier_id::text, po.decided_at, po.expected_
  GROUP BY po.id
 HAVING min(r.received_at) >= %(from)s
  ORDER BY first_received_at, po.number
+"""
+
+
+# Current stock of active SKUs at active warehouses, with the preferred
+# supplier and the units still outstanding on open orders for that warehouse.
+# Drafts count as on order too, so approving a proposal (which raises a draft)
+# stops the same pair from being proposed again.
+STOCK_POSITIONS_SQL = """
+SELECT b.sku_id::text, k.code::text, b.warehouse_id::text, w.code::text,
+       k.preferred_supplier_id::text, s.archived_at IS NOT NULL, b.on_hand,
+       coalesce(o.on_order, 0)::int
+  FROM stock_balances b
+  JOIN skus k ON k.organization_id = b.organization_id AND k.id = b.sku_id
+             AND k.archived_at IS NULL
+  JOIN warehouses w ON w.organization_id = b.organization_id AND w.id = b.warehouse_id
+                   AND w.archived_at IS NULL
+  LEFT JOIN suppliers s ON s.organization_id = k.organization_id AND s.id = k.preferred_supplier_id
+  LEFT JOIN LATERAL (
+    SELECT sum(l.quantity_ordered - l.quantity_received) AS on_order
+      FROM purchase_order_lines l
+      JOIN purchase_orders po
+        ON po.organization_id = l.organization_id AND po.id = l.purchase_order_id
+     WHERE l.organization_id = b.organization_id AND l.sku_id = b.sku_id
+       AND po.warehouse_id = b.warehouse_id
+       AND po.status IN ('draft', 'submitted', 'approved', 'partially_received')
+  ) o ON true
+ WHERE b.organization_id = %s
+ ORDER BY k.code, w.code
+"""
+
+# Units issued per SKU, warehouse and UTC day. Issues are stored as negative deltas.
+DAILY_ISSUES_SQL = """
+SELECT sku_id::text, warehouse_id::text, (occurred_at AT TIME ZONE 'UTC')::date,
+       sum(-quantity_delta)::bigint
+  FROM inventory_events
+ WHERE organization_id = %(org)s AND event_type = 'issue'
+   AND occurred_at >= %(from)s AND occurred_at <= %(to)s
+ GROUP BY 1, 2, 3
 """
 
 
@@ -96,3 +142,24 @@ class PostgresLeadTimeSource:
                           expected_on=r[4], first_received_at=r[5])
             for r in rows
         ]
+
+    def stock_positions(self, organization_id: str) -> list[StockPosition]:
+        with self._connect() as conn:
+            rows = conn.execute(STOCK_POSITIONS_SQL, (organization_id,)).fetchall()
+        return [
+            StockPosition(sku_id=r[0], sku_code=r[1], warehouse_id=r[2], warehouse_code=r[3],
+                          supplier_id=r[4], supplier_archived=bool(r[4]) and r[5],
+                          on_hand=r[6], on_order=r[7])
+            for r in rows
+        ]
+
+    def daily_issues(self, organization_id: str, occurred_from: datetime, occurred_to: datetime
+                     ) -> dict[tuple[str, str], dict[date, int]]:
+        with self._connect() as conn:
+            rows = conn.execute(DAILY_ISSUES_SQL, {
+                "org": organization_id, "from": occurred_from, "to": occurred_to,
+            }).fetchall()
+        issues: dict[tuple[str, str], dict[date, int]] = {}
+        for sku_id, warehouse_id, day, units in rows:
+            issues.setdefault((sku_id, warehouse_id), {})[day] = int(units)
+        return issues

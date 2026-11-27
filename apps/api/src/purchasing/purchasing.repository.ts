@@ -133,7 +133,7 @@ export interface TransitionInput {
 }
 
 /** What both a pool and a checked-out client offer. */
-interface Queryable {
+export interface Queryable {
   query<R extends QueryResultRow>(text: string, values?: unknown[]): Promise<QueryResult<R>>;
 }
 
@@ -183,59 +183,73 @@ export class PurchasingRepository {
     userId: string,
     input: NewPurchaseOrder,
   ): Promise<PurchaseOrder> {
-    return this.transaction(async (client) => {
-      const supplier = await client.query(
-        `SELECT 1 FROM suppliers
-          WHERE organization_id = $1 AND id = $2 AND archived_at IS NULL FOR SHARE`,
-        [organizationId, input.supplierId],
-      );
-      if (!supplier.rows[0]) throw new UnknownReferenceError('supplierId');
-      const warehouse = await client.query(
-        `SELECT 1 FROM warehouses
-          WHERE organization_id = $1 AND id = $2 AND archived_at IS NULL FOR SHARE`,
-        [organizationId, input.warehouseId],
-      );
-      if (!warehouse.rows[0]) throw new UnknownReferenceError('warehouseId');
+    return this.transaction((client) => this.createOrderIn(client, organizationId, userId, input));
+  }
 
-      const costs = await this.lockSkus(client, organizationId, input.lines);
+  /**
+   * Creates a draft inside the caller's transaction, so another write (e.g.
+   * approving a reorder proposal) and the new order commit or fail together.
+   * `auditDetails` are added to the `purchase_order.created` event.
+   */
+  async createOrderIn(
+    client: Queryable,
+    organizationId: string,
+    userId: string,
+    input: NewPurchaseOrder,
+    auditDetails: Record<string, unknown> = {},
+  ): Promise<PurchaseOrder> {
+    const supplier = await client.query(
+      `SELECT 1 FROM suppliers
+        WHERE organization_id = $1 AND id = $2 AND archived_at IS NULL FOR SHARE`,
+      [organizationId, input.supplierId],
+    );
+    if (!supplier.rows[0]) throw new UnknownReferenceError('supplierId');
+    const warehouse = await client.query(
+      `SELECT 1 FROM warehouses
+        WHERE organization_id = $1 AND id = $2 AND archived_at IS NULL FOR SHARE`,
+      [organizationId, input.warehouseId],
+    );
+    if (!warehouse.rows[0]) throw new UnknownReferenceError('warehouseId');
 
-      // The row lock on the counter serializes concurrent creates per organization.
-      const numbered = await client.query<{ last_number: number }>(
-        `INSERT INTO purchase_order_numbers (organization_id, last_number) VALUES ($1, 1)
-         ON CONFLICT (organization_id)
-         DO UPDATE SET last_number = purchase_order_numbers.last_number + 1
-         RETURNING last_number`,
-        [organizationId],
-      );
-      const number = `PO-${String(numbered.rows[0].last_number).padStart(6, '0')}`;
+    const costs = await this.lockSkus(client, organizationId, input.lines);
 
-      const created = await client.query<{ id: string }>(
-        `INSERT INTO purchase_orders
-           (organization_id, number, supplier_id, warehouse_id, expected_on, notes, created_by)
-         VALUES ($1, $2, $3, $4, $5::date, $6, $7)
-         RETURNING id`,
-        [
-          organizationId,
-          number,
-          input.supplierId,
-          input.warehouseId,
-          input.expectedOn,
-          input.notes,
-          userId,
-        ],
-      );
-      const orderId = created.rows[0].id;
-      await this.insertLines(client, organizationId, orderId, input.lines, costs);
-      const order = (await this.readOrder(client, organizationId, orderId)) as PurchaseOrder;
-      await this.audit(client, organizationId, order, {
-        action: 'purchase_order.created',
-        actorId: userId,
-        fromStatus: null,
-        toStatus: null,
-        reason: null,
-      });
-      return order;
+    // The row lock on the counter serializes concurrent creates per organization.
+    const numbered = await client.query<{ last_number: number }>(
+      `INSERT INTO purchase_order_numbers (organization_id, last_number) VALUES ($1, 1)
+       ON CONFLICT (organization_id)
+       DO UPDATE SET last_number = purchase_order_numbers.last_number + 1
+       RETURNING last_number`,
+      [organizationId],
+    );
+    const number = `PO-${String(numbered.rows[0].last_number).padStart(6, '0')}`;
+
+    const created = await client.query<{ id: string }>(
+      `INSERT INTO purchase_orders
+         (organization_id, number, supplier_id, warehouse_id, expected_on, notes, created_by)
+       VALUES ($1, $2, $3, $4, $5::date, $6, $7)
+       RETURNING id`,
+      [
+        organizationId,
+        number,
+        input.supplierId,
+        input.warehouseId,
+        input.expectedOn,
+        input.notes,
+        userId,
+      ],
+    );
+    const orderId = created.rows[0].id;
+    await this.insertLines(client, organizationId, orderId, input.lines, costs);
+    const order = (await this.readOrder(client, organizationId, orderId)) as PurchaseOrder;
+    await this.audit(client, organizationId, order, {
+      action: 'purchase_order.created',
+      actorId: userId,
+      fromStatus: null,
+      toStatus: null,
+      reason: null,
+      details: auditDetails,
     });
+    return order;
   }
 
   /**

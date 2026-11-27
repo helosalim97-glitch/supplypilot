@@ -39,3 +39,28 @@ export function loadImportWorkerConfig(env: NodeJS.ProcessEnv = process.env): Im
     staleAfterSeconds: read('IMPORT_STALE_AFTER_SECONDS', 600, 30, 86_400),
   };
 }
+
+export interface WorkerClientConfig {
+  /** Base URL of the forecasting worker (services/worker); null turns reorder runs off. */
+  url: string | null;
+  /** Bearer token the worker expects (WORKER_SERVICE_TOKEN, at least 32 characters). */
+  serviceToken: string | null;
+  timeoutMs: number;
+}
+
+export function loadWorkerClientConfig(env: NodeJS.ProcessEnv = process.env): WorkerClientConfig {
+  const url = env.WORKER_URL || null;
+  if (url !== null && !/^https?:\/\/[^\s/]+/.test(url)) {
+    throw new Error(`WORKER_URL must be an http(s) URL, got "${url}"`);
+  }
+  const serviceToken = env.WORKER_SERVICE_TOKEN || null;
+  if (serviceToken !== null && serviceToken.length < 32) {
+    throw new Error('WORKER_SERVICE_TOKEN must be at least 32 characters');
+  }
+  const rawTimeout = env.WORKER_TIMEOUT_MS;
+  const timeoutMs = rawTimeout ? Number(rawTimeout) : 15_000;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 120_000) {
+    throw new Error(`WORKER_TIMEOUT_MS must be a whole number from 100 to 120000, got "${rawTimeout}"`);
+  }
+  return { url: url?.replace(/\/+$/, '') ?? null, serviceToken, timeoutMs };
+}
