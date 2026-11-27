@@ -188,3 +188,57 @@ def test_short_service_token_is_refused(monkeypatch):
     with pytest.raises(ValueError):
         Settings.from_env()
 
+
+
+CALC = "/v1/reorder-calculations"
+CALC_BODY = {"dailyDemand": [8, 12] * 7, "leadTime": {"meanDays": 9, "stdDevDays": 0},
+             "onHand": 60, "onOrder": 10, "reviewPeriodDays": 7, "minOrderQty": 50,
+             "orderMultiple": 24}
+
+
+def test_reorder_calculation_returns_quantity_and_evidence(client):
+    res = client.post(CALC, json=CALC_BODY, headers=AUTH)
+    assert res.status_code == 200
+    body = res.json()
+    # d = 10, L = 9, R = 7, SS = 11 -> ROP 101, order-up-to 171, position 70, raw 101 -> 5 packs
+    assert body["reorderPoint"] == 101
+    assert body["safetyStock"] == 11
+    assert body["orderUpTo"] == 171
+    assert body["inventoryPosition"] == 70
+    assert body["shouldReorder"] is True
+    assert body["suggestedOrderQty"] == 120
+    assert body["daysOfCover"] == 6.0
+    assert body["warnings"] == []
+    evidence = body["evidence"]
+    assert evidence["meanDailyDemand"] == 10
+    assert evidence["z"] == 1.6449
+    assert evidence["leadTimeDemand"] == 90
+    assert evidence["rawOrderQty"] == 101
+    assert evidence["leadTimeSource"] == "observed"
+
+
+def test_reorder_calculation_needs_the_token_but_no_database():
+    client = TestClient(create_app(Settings(database_url=None, service_token=TOKEN), None))
+    assert client.post(CALC, json=CALC_BODY).status_code == 401
+    assert client.post(CALC, json=CALC_BODY, headers=AUTH).status_code == 200
+    # Lead-time routes still need the database.
+    assert client.get(LIST, headers=AUTH).status_code == 503
+
+
+@pytest.mark.parametrize(("patch", "field"), [
+    ({"serviceLevel": 1.0}, "serviceLevel"),
+    ({"reviewPeriodDays": 120}, "reviewPeriodDays"),
+    ({"leadTime": {"meanDays": 500}}, "leadTime.meanDays"),
+    ({"dailyDemand": [1, -2]}, "dailyDemand"),
+    ({"dailyDemand": []}, "dailyDemand"),
+    ({"onHand": -1}, "onHand"),
+    ({"orderMultiple": 0}, "orderMultiple"),
+    ({"leadTime": {"meanDays": 5, "source": "guess"}}, "leadTime.source"),
+    ({"unexpected": True}, "unexpected"),
+])
+def test_reorder_calculation_validation(client, patch, field):
+    res = client.post(CALC, json={**CALC_BODY, **patch}, headers=AUTH)
+    assert res.status_code == 422
+    error = res.json()["error"]
+    assert error["code"] == "validation_failed"
+    assert any(d["field"].startswith(field) for d in error["details"])

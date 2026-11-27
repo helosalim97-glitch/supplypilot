@@ -36,12 +36,52 @@ ignored, so a fixed `asOf` gives a reproducible answer.
 | GET | `/health` | No token. `configured` is false without a token or database |
 | GET | `/v1/organizations/{orgId}/supplier-lead-times` | Every active supplier, plus archived ones with history in the window |
 | GET | `/v1/organizations/{orgId}/suppliers/{supplierId}/lead-time` | Statistics plus the 100 most recent samples |
+| POST | `/v1/reorder-calculations` | Reorder-point calculator (below); needs no database |
 
 `/v1` routes need `Authorization: Bearer <WORKER_SERVICE_TOKEN>`: 401 for a
-missing or wrong token, 503 if the worker has no token or database configured.
+missing or wrong token, 503 if the worker has no token configured (or, for the lead-time routes, no
+database).
 Unknown organizations and suppliers of another organization are 404. Errors
 use the API's envelope, `{"error": {"code", "message", "details"?, "requestId"}}`,
 and the `X-Request-Id` header is honoured and echoed.
+
+## Reorder-point calculator
+
+`POST /v1/reorder-calculations` takes explicit inputs for one SKU at one
+warehouse and returns the reorder decision plus every intermediate value, so a
+reviewer can redo the arithmetic. It reads nothing from the database (only the
+service token is needed); the API will feed it demand history and the
+supplier's lead time when it builds reorder proposals.
+
+```
+safety stock  = ceil(z * sqrt(L * sd_d² + d² * sd_L²))
+reorder point = ceil(d * L) + safety stock
+order-up-to   = ceil(d * (L + R)) + safety stock
+```
+
+`d` and `sd_d` are the mean and sample standard deviation of daily demand
+(zero days included), `L` and `sd_L` the lead time in days, `R` the review
+period and `z` the standard normal quantile for the cycle service level
+(0.5–0.999, default 0.95 → z = 1.6449). Results are rounded up to whole units.
+
+When the inventory position (`onHand + onOrder`) is at or below the reorder
+point, the raw quantity is `orderUpTo − position`; it is rounded up to
+`orderMultiple`, then up to `minOrderQty` (itself rounded to whole packs). With
+no demand the calculator never reorders.
+
+| Field | Default | Rules |
+|---|---|---|
+| `dailyDemand` | — | 1–1095 non-negative numbers, oldest first |
+| `leadTime.meanDays` / `stdDevDays` | — / 0 | 0–365 |
+| `leadTime.source` | `observed` | `observed` or `nominal` |
+| `onHand` / `onOrder` | — / 0 | integers ≥ 0 |
+| `serviceLevel` | 0.95 | 0.5–0.999 |
+| `reviewPeriodDays` | 0 | 0–90 |
+| `minOrderQty` / `orderMultiple` | 1 / 1 | integers ≥ 1 |
+
+Warnings flag thin evidence: `short_demand_history` (fewer than 14 days),
+`nominal_lead_time`, `no_demand`, `out_of_stock`. Invalid inputs are 422
+`validation_failed` with the offending field in `details`.
 
 ## Running
 

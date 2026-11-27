@@ -15,11 +15,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .lead_times import LeadTimeSample, LeadTimeStats, build_samples, summarize_samples
+from .reorder import (MAX_DEMAND_DAYS, LeadTime, ReorderInput, ReorderInputError,
+                      ReorderResult, calculate)
 from .repository import LeadTimeSource, PostgresLeadTimeSource, Supplier, read_only_connection
 from .settings import Settings
 
@@ -33,6 +36,30 @@ MAX_SAMPLES_RETURNED = 100
 
 HTTP_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
               405: "method_not_allowed", 422: "validation_failed", 503: "service_unavailable"}
+
+
+class LeadTimeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    mean_days: float = Field(alias="meanDays", ge=0)
+    std_dev_days: float = Field(0, alias="stdDevDays", ge=0)
+    source: str = Field("observed", pattern="^(observed|nominal)$")
+
+
+class ReorderCalculationBody(BaseModel):
+    """Explicit inputs for one SKU at one warehouse; nothing is read from the database."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    daily_demand: list[float] = Field(alias="dailyDemand", min_length=1,
+                                      max_length=MAX_DEMAND_DAYS)
+    lead_time: LeadTimeBody = Field(alias="leadTime")
+    on_hand: int = Field(alias="onHand", ge=0)
+    on_order: int = Field(0, alias="onOrder", ge=0)
+    service_level: float = Field(0.95, alias="serviceLevel")
+    review_period_days: float = Field(0, alias="reviewPeriodDays")
+    min_order_qty: int = Field(1, alias="minOrderQty", ge=1)
+    order_multiple: int = Field(1, alias="orderMultiple", ge=1)
 
 
 class WorkerError(Exception):
@@ -71,6 +98,11 @@ def create_app(settings: Settings | None = None, source: LeadTimeSource | None =
     async def worker_error(request: Request, exc: WorkerError):
         return _envelope(request, exc.status, exc.code, exc.message)
 
+    @app.exception_handler(ReorderInputError)
+    async def reorder_input_error(request: Request, exc: ReorderInputError):
+        return _envelope(request, 422, "validation_failed", "Request validation failed",
+                         [{"field": exc.field, "message": exc.message}])
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
         details = [{"field": ".".join(str(p) for p in e["loc"][1:]), "message": e["msg"]}
@@ -90,17 +122,23 @@ def create_app(settings: Settings | None = None, source: LeadTimeSource | None =
                      type(exc).__name__, exc_info=exc)
         return _envelope(request, 500, "internal_error", "Internal server error")
 
-    def require_service(request: Request) -> LeadTimeSource:
-        if not settings.service_token or source is None:
+    def require_token(request: Request) -> None:
+        if not settings.service_token:
             raise WorkerError(503, "service_unavailable", "Worker is not configured")
         header = request.headers.get("authorization", "")
         scheme, _, token = header.partition(" ")
         if scheme.lower() != "bearer" or not hmac.compare_digest(
                 token.strip().encode(), settings.service_token.encode()):
             raise WorkerError(401, "unauthorized", "Missing or invalid service token")
+
+    def require_service(request: Request) -> LeadTimeSource:
+        require_token(request)
+        if source is None:
+            raise WorkerError(503, "service_unavailable", "Worker is not configured")
         return source
 
     Source = Annotated[LeadTimeSource, Depends(require_service)]
+    Token = Annotated[None, Depends(require_token)]
     WindowDays = Annotated[int, Query(alias="windowDays", ge=1, le=MAX_WINDOW_DAYS)]
     AsOf = Annotated[datetime | None, Query(alias="asOf")]
 
@@ -157,7 +195,45 @@ def create_app(settings: Settings | None = None, source: LeadTimeSource | None =
                 "leadTime": _stats_json(summarize_samples(samples, excluded)),
                 "samples": [_sample_json(s) for s in recent]}
 
+    @app.post("/v1/reorder-calculations")
+    def reorder_calculation(body: ReorderCalculationBody, _: Token):
+        # Stateless: needs the service token but no database.
+        result = calculate(ReorderInput(
+            daily_demand=body.daily_demand,
+            lead_time=LeadTime(body.lead_time.mean_days, body.lead_time.std_dev_days,
+                               body.lead_time.source),
+            on_hand=body.on_hand, on_order=body.on_order, service_level=body.service_level,
+            review_period_days=body.review_period_days, min_order_qty=body.min_order_qty,
+            order_multiple=body.order_multiple))
+        return _reorder_json(result)
+
     return app
+
+
+def _reorder_json(result: ReorderResult) -> dict:
+    return {
+        "shouldReorder": result.should_reorder,
+        "suggestedOrderQty": result.suggested_order_qty,
+        "reorderPoint": result.reorder_point,
+        "safetyStock": result.safety_stock,
+        "orderUpTo": result.order_up_to,
+        "inventoryPosition": result.inventory_position,
+        "daysOfCover": _round(result.days_of_cover, 1),
+        "warnings": list(result.warnings),
+        "evidence": {
+            "demandDays": result.demand_days,
+            "meanDailyDemand": _round(result.mean_daily_demand, 3),
+            "demandStdDev": _round(result.demand_std_dev, 3),
+            "leadTimeDays": _round(result.lead_time_days),
+            "leadTimeStdDev": _round(result.lead_time_std_dev),
+            "leadTimeSource": result.lead_time_source,
+            "serviceLevel": result.service_level,
+            "z": _round(result.z, 4),
+            "leadTimeDemand": _round(result.lead_time_demand),
+            "leadTimeDemandStdDev": _round(result.lead_time_demand_std_dev, 3),
+            "rawOrderQty": result.raw_order_qty,
+        },
+    }
 
 
 def _round(value: float | None, digits: int = 2) -> float | None:
