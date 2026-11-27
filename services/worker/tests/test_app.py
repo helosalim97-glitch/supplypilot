@@ -1,0 +1,190 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+
+from supplypilot_worker.app import create_app
+from supplypilot_worker.lead_times import OrderDelivery
+from supplypilot_worker.repository import Supplier
+from supplypilot_worker.settings import Settings
+
+TOKEN = "t" * 40
+ORG = "0d6f1a52-6a0e-4a43-9d2b-1f6a7c1e0001"
+OTHER_ORG = "0d6f1a52-6a0e-4a43-9d2b-1f6a7c1e0002"
+STEADY = "5b8e0c1e-3f55-4b8e-8a40-000000000001"
+ERRATIC = "5b8e0c1e-3f55-4b8e-8a40-000000000002"
+NEW = "5b8e0c1e-3f55-4b8e-8a40-000000000003"
+OLD = "5b8e0c1e-3f55-4b8e-8a40-000000000004"
+FOREIGN = "5b8e0c1e-3f55-4b8e-8a40-000000000005"
+AS_OF = datetime(2026, 6, 30, tzinfo=timezone.utc)
+
+
+class FakeSource:
+    def __init__(self):
+        self.calls = []
+        self.orgs = {ORG: [Supplier(STEADY, "SUP-STEADY", "Steady Synthetic Co", False),
+                           Supplier(ERRATIC, "SUP-ERRATIC", "Erratic Synthetic Co", False),
+                           Supplier(NEW, "SUP-NEW", "New Synthetic Co", False),
+                           Supplier(OLD, "SUP-OLD", "Archived Synthetic Co", True)],
+                     OTHER_ORG: [Supplier(FOREIGN, "SUP-X", "Other Tenant Co", False)]}
+        self.rows = []
+        start = datetime(2026, 4, 1, 8, tzinfo=timezone.utc)
+        for i, days in enumerate([6, 7, 6, 7, 6]):
+            self.add(ORG, STEADY, i, start + timedelta(days=7 * i), days,
+                     expected=(start + timedelta(days=7 * i + 6)).date())
+        for i, days in enumerate([2, 15, 4, 20, -1]):
+            self.add(ORG, ERRATIC, 10 + i, start + timedelta(days=7 * i), days)
+        self.add(OTHER_ORG, FOREIGN, 99, start, 3)
+
+    def add(self, org, supplier, n, approved, days, expected=None):
+        self.rows.append((org, OrderDelivery(f"po-{n}", f"PO-{n:06d}", supplier, approved,
+                                             approved + timedelta(days=days), expected)))
+
+    def organization_exists(self, organization_id):
+        return organization_id in self.orgs
+
+    def suppliers(self, organization_id):
+        return list(self.orgs.get(organization_id, []))
+
+    def deliveries(self, organization_id, received_from, received_to, supplier_id=None):
+        self.calls.append((organization_id, received_from, received_to, supplier_id))
+        return [d for org, d in self.rows
+                if org == organization_id and received_from <= d.first_received_at <= received_to
+                and (supplier_id is None or d.supplier_id == supplier_id)]
+
+
+@pytest.fixture
+def source():
+    return FakeSource()
+
+
+@pytest.fixture
+def client(source):
+    return TestClient(create_app(Settings(database_url=None, service_token=TOKEN), source))
+
+
+AUTH = {"authorization": f"Bearer {TOKEN}"}
+LIST = f"/v1/organizations/{ORG}/supplier-lead-times"
+
+
+def test_health_needs_no_token(client):
+    assert client.get("/health").json() == {"status": "ok", "configured": True}
+
+
+@pytest.mark.parametrize("headers", [{}, {"authorization": "Bearer wrong"},
+                                     {"authorization": f"Basic {TOKEN}"}])
+def test_rejects_missing_or_wrong_token(client, headers):
+    res = client.get(LIST, headers=headers)
+    assert res.status_code == 401
+    assert res.json()["error"]["code"] == "unauthorized"
+    assert TOKEN not in res.text
+
+
+def test_unconfigured_worker_refuses_requests(source):
+    client = TestClient(create_app(Settings(database_url=None, service_token=None), source))
+    res = client.get(LIST, headers=AUTH)
+    assert res.status_code == 503
+    assert res.json()["error"]["code"] == "service_unavailable"
+    assert client.get("/health").json()["configured"] is False
+
+
+def test_lists_supplier_lead_times(client):
+    res = client.get(LIST, params={"asOf": AS_OF.isoformat(), "windowDays": 180}, headers=AUTH)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["organizationId"] == ORG
+    assert body["window"] == {"from": "2026-01-01T00:00:00Z", "to": "2026-06-30T00:00:00Z", "days": 180}
+    by_code = {s["supplierCode"]: s for s in body["suppliers"]}
+    # Archived suppliers without history in the window are left out.
+    assert list(by_code) == ["SUP-STEADY", "SUP-ERRATIC", "SUP-NEW"]
+
+    steady = by_code["SUP-STEADY"]["leadTime"]
+    assert steady == {"sampleCount": 5, "excludedCount": 0, "meanDays": 6.4, "stdDevDays": 0.55,
+                      "minDays": 6.0, "maxDays": 7.0, "p50Days": 6.0, "p90Days": 7.0,
+                      "coefficientOfVariation": 0.086, "onTimeRate": 0.6, "lateCount": 2,
+                      "reliability": "consistent"}
+    erratic = by_code["SUP-ERRATIC"]["leadTime"]
+    assert erratic["sampleCount"] == 4 and erratic["excludedCount"] == 1
+    assert erratic["reliability"] == "erratic"
+    assert erratic["onTimeRate"] is None
+    assert by_code["SUP-NEW"]["leadTime"]["reliability"] == "insufficient_data"
+
+
+def test_window_limits_the_samples(client, source):
+    res = client.get(LIST, params={"asOf": "2026-04-20T00:00:00Z", "windowDays": 10}, headers=AUTH)
+    body = res.json()
+    counts = {s["supplierCode"]: s["leadTime"]["sampleCount"] for s in body["suppliers"]}
+    assert counts == {"SUP-STEADY": 1, "SUP-ERRATIC": 1, "SUP-NEW": 0}
+    org, start, end, supplier = source.calls[-1]
+    assert (org, supplier) == (ORG, None)
+    assert end - start == timedelta(days=10)
+
+
+def test_supplier_detail_lists_recent_samples_first(client):
+    res = client.get(f"/v1/organizations/{ORG}/suppliers/{STEADY}/lead-time",
+                     params={"asOf": AS_OF.isoformat()}, headers=AUTH)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["supplierName"] == "Steady Synthetic Co"
+    assert body["leadTime"]["sampleCount"] == 5
+    numbers = [s["orderNumber"] for s in body["samples"]]
+    assert numbers == ["PO-000004", "PO-000003", "PO-000002", "PO-000001", "PO-000000"]
+    first = body["samples"][-1]
+    assert first == {"orderId": "po-0", "orderNumber": "PO-000000",
+                     "approvedAt": "2026-04-01T08:00:00Z", "firstReceivedAt": "2026-04-07T08:00:00Z",
+                     "leadTimeDays": 6.0, "expectedOn": "2026-04-07", "onTime": True}
+
+
+def test_other_tenants_supplier_is_not_found(client, source):
+    res = client.get(f"/v1/organizations/{ORG}/suppliers/{FOREIGN}/lead-time", headers=AUTH)
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "not_found"
+    assert all(call[0] == ORG for call in source.calls)
+
+
+def test_unknown_organization_is_not_found(client):
+    res = client.get("/v1/organizations/0d6f1a52-6a0e-4a43-9d2b-1f6a7c1e0999/supplier-lead-times",
+                     headers=AUTH)
+    assert res.status_code == 404
+
+
+@pytest.mark.parametrize(("path", "params"), [
+    ("/v1/organizations/not-a-uuid/supplier-lead-times", {}),
+    (LIST, {"windowDays": 0}),
+    (LIST, {"windowDays": 2000}),
+    (LIST, {"asOf": "yesterday"}),
+    (LIST, {"asOf": "2026-06-30T00:00:00"}),
+])
+def test_validation_errors_use_the_envelope(client, path, params):
+    res = client.get(path, params=params, headers={**AUTH, "x-request-id": "req-12345678"})
+    assert res.status_code == 422
+    error = res.json()["error"]
+    assert error["code"] == "validation_failed"
+    assert error["requestId"] == "req-12345678"
+    assert res.headers["x-request-id"] == "req-12345678"
+
+
+def test_unsafe_request_id_is_replaced(client):
+    res = client.get("/health", headers={"x-request-id": "bad id\n"})
+    assert res.headers["x-request-id"] != "bad id\n"
+    assert len(res.headers["x-request-id"]) == 36
+
+
+def test_unexpected_errors_hide_details(source):
+    def boom(*args, **kwargs):
+        raise RuntimeError("connection to secret-host failed")
+
+    source.deliveries = boom
+    client = TestClient(create_app(Settings(database_url=None, service_token=TOKEN), source),
+                        raise_server_exceptions=False)
+    res = client.get(LIST, headers=AUTH)
+    assert res.status_code == 500
+    assert res.json()["error"]["code"] == "internal_error"
+    assert "secret-host" not in res.text
+
+
+def test_short_service_token_is_refused(monkeypatch):
+    monkeypatch.setenv("WORKER_SERVICE_TOKEN", "short")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+

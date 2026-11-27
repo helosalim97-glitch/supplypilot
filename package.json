@@ -16,6 +16,8 @@
     "web:dev": "pnpm --filter @supplypilot/web dev",
     "db:migrate": "pnpm --filter @supplypilot/api migrate",
     "test:fixtures": "cd packages/fixtures && python3 -m unittest discover -s tests -t .",
-    "fixtures": "cd packages/fixtures && python3 -m supplypilot_fixtures --out ../../.fixtures"
+    "fixtures": "cd packages/fixtures && python3 -m supplypilot_fixtures --out ../../.fixtures",
+    "worker:dev": "cd services/worker && python3 -m supplypilot_worker",
+    "worker:test": "cd services/worker && python3 -m pytest"
   }
 }
